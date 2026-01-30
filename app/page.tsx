@@ -1,6 +1,8 @@
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getOrCreateThread } from "./actions/getOrCreateThread";
+import ChatComposer from "@/app/components/ChatComposer";
+
 
 const BRAND = "#49257a";
 
@@ -64,7 +66,8 @@ export default async function Home() {
         )}
       </div>
 
-      {/* Input comes next */}
+    <ChatComposer threadId={threadId} />
+
     </main>
   );
 }
