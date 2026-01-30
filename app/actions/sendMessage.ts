@@ -16,7 +16,12 @@ function pickAccount(candidates: Candidate[]) {
 
   // ✅ Auto-link only when confident + clearly best
   if (topScore >= 0.68 && margin >= 0.08) {
-    return { kind: "auto" as const, account_id: top.account_id, name: top.name, score: topScore };
+    return {
+      kind: "auto" as const,
+      account_id: top.account_id,
+      name: top.name,
+      score: topScore,
+    };
   }
 
   // 🤔 Ask for clarification when we have plausible options
@@ -43,7 +48,7 @@ export async function sendMessage(threadId: string, content: string) {
   if (profileErr) throw profileErr;
   const tenant_id = profile!.tenant_id;
 
-  // 1) Insert user message (we'll update it with candidates afterward)
+  // 1) Insert user message
   const { data: userMsg, error: msgErr } = await supabase
     .from("chat_messages")
     .insert({
@@ -57,15 +62,18 @@ export async function sendMessage(threadId: string, content: string) {
 
   if (msgErr) throw msgErr;
 
-  // 2) Search for account candidates using SQL function
-  const { data: candidatesRaw, error: searchErr } = await supabase.rpc("search_accounts", {
-    p_tenant_id: tenant_id,
-    p_query: content.trim(),
-    p_limit: 5,
-  });
+  // 2) Search for account candidates
+  const { data: candidatesRaw, error: searchErr } = await supabase.rpc(
+    "search_accounts",
+    {
+      p_tenant_id: tenant_id,
+      p_query: content.trim(),
+      p_limit: 5,
+    }
+  );
 
   if (searchErr) {
-    // If search fails, fall back to normal stub response
+    // fall back to stub reply
     await supabase.from("chat_messages").insert({
       tenant_id,
       thread_id: threadId,
@@ -90,7 +98,7 @@ export async function sendMessage(threadId: string, content: string) {
 
   const decision = pickAccount(candidates);
 
-  // 3) If thread already has an account_id, do not override it automatically (Phase 1 safety)
+  // 3) If thread already has an account_id, do not override automatically
   const { data: thread } = await supabase
     .from("chat_threads")
     .select("account_id")
@@ -101,7 +109,6 @@ export async function sendMessage(threadId: string, content: string) {
 
   if (!threadHasAccount) {
     if (decision.kind === "auto") {
-      // Auto-link the thread
       await supabase
         .from("chat_threads")
         .update({
@@ -131,8 +138,39 @@ export async function sendMessage(threadId: string, content: string) {
         thread_id: threadId,
         role: "assistant",
         agent_used: "system.account_resolution",
-        content:
-          `Quick check — which account do you mean?\n\n${lines}\n\nReply with 1, 2, or 3 (or type the exact name).`,
+        content: `Quick check — which account do you mean?\n\n${lines}\n\nReply with 1, 2, or 3 (or type the exact name).`,
+      });
+
+      return;
+    }
+
+    // decision.kind === "none" → create account implicitly
+    const guessedName = content.trim().slice(0, 80);
+
+    const { data: newAccount, error: accErr } = await supabase
+      .from("accounts")
+      .insert({
+        tenant_id,
+        name: guessedName,
+      })
+      .select("id, name")
+      .single();
+
+    if (!accErr && newAccount?.id) {
+      await supabase
+        .from("chat_threads")
+        .update({
+          account_id: newAccount.id,
+          last_account_confidence: 0.4,
+        })
+        .eq("id", threadId);
+
+      await supabase.from("chat_messages").insert({
+        tenant_id,
+        thread_id: threadId,
+        role: "assistant",
+        agent_used: "system.account_resolution",
+        content: `I don’t have that account yet, so I created one as **${newAccount.name}**. If that name is slightly off, tell me the exact hospital name and I’ll correct it.`,
       });
 
       return;
