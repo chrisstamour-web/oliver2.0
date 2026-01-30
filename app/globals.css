@@ -1,8 +1,14 @@
 @import "tailwindcss";
+:root {
+  --oliver-purple: #49257a;
+}
 
 :root {
   --background: #ffffff;
   --foreground: #171717;
+}
+a {
+  color: var(--oliver-purple);
 }
 
 @theme inline {
