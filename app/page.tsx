@@ -1,8 +1,9 @@
+// app/page.tsx
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getOrCreateThread } from "./actions/getOrCreateThread";
-import ChatComposer from "@/app/components/ChatComposer";
-
+import ChatPanel from "@/app/components/ChatPanel";
+import MainHeader from "./components/MainHeader";
 
 const BRAND = "#49257a";
 
@@ -14,60 +15,30 @@ export default async function Home() {
 
   const threadId = await getOrCreateThread();
 
-  const { data: messages } = await supabase
+  const { data: messages, error } = await supabase
     .from("chat_messages")
     .select("id, role, content, created_at")
     .eq("thread_id", threadId)
     .order("created_at", { ascending: true });
 
+  if (error) {
+    console.warn("Failed to load chat_messages:", error.message);
+  }
+
   return (
-    <main style={{ maxWidth: 820, margin: "40px auto", padding: 16 }}>
-      <h1 style={{ fontWeight: 900, color: BRAND, marginBottom: 12 }}>
-        Oliver 2.0
-      </h1>
+    <div style={{ background: "#fff", minHeight: "100vh" }}>
+      <main style={{ maxWidth: 820, margin: "28px auto", padding: 16 }}>
+        {/* 👇 This wrapper forces header + chat to share the same centered width */}
+        <div style={{ maxWidth: 680, margin: "0 auto" }}>
+          <MainHeader />
 
-      <div
-        style={{
-          border: "1px solid #e7e7e7",
-          borderRadius: 16,
-          padding: 16,
-          minHeight: 300,
-          marginBottom: 12,
-        }}
-      >
-        {messages?.length ? (
-          messages.map((m) => (
-            <div
-              key={m.id}
-              style={{
-                marginBottom: 10,
-                textAlign: m.role === "user" ? "right" : "left",
-              }}
-            >
-              <div
-                style={{
-                  display: "inline-block",
-                  background:
-                    m.role === "user" ? BRAND : "#f3f3f3",
-                  color: m.role === "user" ? "white" : "#111",
-                  padding: "8px 12px",
-                  borderRadius: 12,
-                  maxWidth: "80%",
-                }}
-              >
-                {m.content}
-              </div>
-            </div>
-          ))
-        ) : (
-          <div style={{ opacity: 0.6 }}>
-            Start the conversation…
-          </div>
-        )}
-      </div>
-
-    <ChatComposer threadId={threadId} />
-
-    </main>
+          <ChatPanel
+            threadId={threadId}
+            initialMessages={(messages ?? []) as any[]}
+            brandColor={BRAND}
+          />
+        </div>
+      </main>
+    </div>
   );
 }
