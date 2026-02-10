@@ -14,6 +14,12 @@ export async function callClaude(args: {
   system?: string;
   model?: string;
   maxTokens?: number;
+
+  /**
+   * If true, ask Claude to return JSON-only.
+   * (Models that don't support it will typically ignore it.)
+   */
+  json?: boolean;
 }): Promise<{ ok: boolean; text: string; raw?: any; error?: string }> {
   try {
     const apiKey = mustGetEnv("ANTHROPIC_API_KEY");
@@ -30,6 +36,18 @@ export async function callClaude(args: {
         content: m.content,
       }));
 
+    const body: any = {
+      model,
+      max_tokens,
+      system: args.system ?? "",
+      messages,
+    };
+
+    if (args.json) {
+      // Best-effort strict JSON mode
+      body.response_format = { type: "json_object" };
+    }
+
     // Hard timeout to avoid hanging requests
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 45_000);
@@ -42,12 +60,7 @@ export async function callClaude(args: {
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({
-        model,
-        max_tokens,
-        system: args.system ?? "",
-        messages,
-      }),
+      body: JSON.stringify(body),
     }).finally(() => clearTimeout(t));
 
     const raw = await res.json().catch(() => ({}));
