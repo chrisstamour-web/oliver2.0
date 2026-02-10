@@ -49,10 +49,11 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const callbackUrl = useMemo(() => {
-    // client-only; safe because this file is "use client"
-    return `${window.location.origin}/auth/callback`;
-  }, []);
+const callbackUrl = useMemo(() => {
+  if (typeof window === "undefined") return "/auth/callback";
+  return `${window.location.origin}/auth/callback`;
+}, []);
+
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
