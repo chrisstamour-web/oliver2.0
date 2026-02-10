@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createSupabaseBrowserClient } from "@/lib/supabase/browser";
 
@@ -9,10 +9,22 @@ const BRAND = "#49257a";
 function GoogleIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
-      <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.6 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.1-.1-2.2-.4-3.5z" />
-      <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.3 19 12 24 12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4c-7.7 0-14.4 4.3-17.7 10.7z" />
-      <path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.2C29.4 35.6 26.8 36 24 36c-5.3 0-9.7-3.4-11.3-8.1l-6.6 5.1C9.3 39.7 16.1 44 24 44z" />
-      <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3-3.2 5.2-5.9 6.6l.0 0 6.3 5.2C39.2 36.7 44 31.3 44 24c0-1.1-.1-2.2-.4-3.5z" />
+      <path
+        fill="#FFC107"
+        d="M43.6 20.5H42V20H24v8h11.3C33.7 32.6 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.1-.1-2.2-.4-3.5z"
+      />
+      <path
+        fill="#FF3D00"
+        d="M6.3 14.7l6.6 4.8C14.7 15.3 19 12 24 12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4c-7.7 0-14.4 4.3-17.7 10.7z"
+      />
+      <path
+        fill="#4CAF50"
+        d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.2C29.4 35.6 26.8 36 24 36c-5.3 0-9.7-3.4-11.3-8.1l-6.6 5.1C9.3 39.7 16.1 44 24 44z"
+      />
+      <path
+        fill="#1976D2"
+        d="M43.6 20.5H42V20H24v8h11.3c-1.1 3-3.2 5.2-5.9 6.6l.0 0 6.3 5.2C39.2 36.7 44 31.3 44 24c0-1.1-.1-2.2-.4-3.5z"
+      />
     </svg>
   );
 }
@@ -30,17 +42,17 @@ function MicrosoftIcon() {
 
 export default function LoginPage() {
   const router = useRouter();
-  const supabase = createSupabaseBrowserClient();
+  const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  function callbackUrl() {
-    // works for localhost + prod
+  const callbackUrl = useMemo(() => {
+    // client-only; safe because this file is "use client"
     return `${window.location.origin}/auth/callback`;
-  }
+  }, []);
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
@@ -48,9 +60,10 @@ export default function LoginPage() {
     setLoading(true);
 
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    setLoading(false);
 
+    setLoading(false);
     if (error) return setError(error.message);
+
     router.push("/");
     router.refresh();
   }
@@ -61,19 +74,22 @@ export default function LoginPage() {
     setLoading(true);
 
     const { error } = await supabase.auth.signUp({ email, password });
-    setLoading(false);
 
+    setLoading(false);
     if (error) return setError(error.message);
+
     alert("Account created. If email confirmation is enabled, check your inbox.");
   }
 
   async function signInWithGoogle() {
     setError(null);
     setLoading(true);
+
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: callbackUrl() },
+      options: { redirectTo: callbackUrl },
     });
+
     if (error) setError(error.message);
     setLoading(false);
   }
@@ -81,10 +97,12 @@ export default function LoginPage() {
   async function signInWithMicrosoft() {
     setError(null);
     setLoading(true);
+
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "azure",
-      options: { redirectTo: callbackUrl() },
+      options: { redirectTo: callbackUrl },
     });
+
     if (error) setError(error.message);
     setLoading(false);
   }
@@ -111,7 +129,13 @@ export default function LoginPage() {
   return (
     <main style={{ maxWidth: 420, margin: "56px auto", padding: 16 }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18 }}>
-        <img src="/logo.png" alt="Oliver" width={34} height={34} style={{ borderRadius: 10 }} />
+        <img
+          src="/logo.png"
+          alt="Oliver"
+          width={34}
+          height={34}
+          style={{ borderRadius: 10 }}
+        />
         <div style={{ lineHeight: 1.1 }}>
           <div style={{ fontSize: 18, fontWeight: 900, color: BRAND }}>Oliver 2.0</div>
           <div style={{ fontSize: 13, opacity: 0.75 }}>Sign in to continue</div>

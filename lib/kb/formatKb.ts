@@ -1,5 +1,5 @@
 // src/lib/kb/formatKb.ts
-import type { KbHit } from "./searchKB";
+import type { KbHit } from "./searchKb";
 
 function truncate(s: string, max = 1600) {
   const t = (s ?? "").trim();

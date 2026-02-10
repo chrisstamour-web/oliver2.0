@@ -14,16 +14,10 @@ export const viewport: Viewport = {
   themeColor: "#49257a",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-<body className="min-h-[100dvh] w-full overflow-x-hidden overflow-y-auto">
-
-        {/* App root wrapper: allows pages to use full height reliably */}
+      <body className="min-h-[100dvh] w-full overflow-x-hidden overflow-y-auto bg-white">
         <div id="app-root" className="min-h-[100dvh] w-full">
           {children}
         </div>

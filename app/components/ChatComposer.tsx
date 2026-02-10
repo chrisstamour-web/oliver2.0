@@ -6,6 +6,24 @@ import { sendMessage } from "@/app/actions/sendMessage";
 
 const BRAND = "#49257a";
 
+function Spinner() {
+  return (
+    <span
+      aria-label="Loading"
+      style={{
+        width: 14,
+        height: 14,
+        borderRadius: "50%",
+        border: "2px solid rgba(0,0,0,0.2)",
+        borderTopColor: "rgba(0,0,0,0.7)",
+        display: "inline-block",
+        animation: "spin 0.9s linear infinite",
+        flex: "0 0 auto",
+      }}
+    />
+  );
+}
+
 export default function ChatComposer({
   threadId,
   ensureThreadId,
@@ -47,10 +65,29 @@ export default function ChatComposer({
         body: JSON.stringify({ threadId: nextThreadId }),
       });
 
-      if (!resp.ok) {
-        const t = await resp.text();
-        throw new Error(`respond failed (${resp.status}): ${t.slice(0, 200)}`);
+      const raw = await resp.text(); // read once
+      let data: any = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = { _nonJson: raw };
       }
+
+      if (!resp.ok) {
+        const errMsg =
+          (data && (data.error || data.message)) ||
+          (typeof raw === "string" ? raw : "") ||
+          `HTTP ${resp.status}`;
+        throw new Error(`respond failed (${resp.status}): ${String(errMsg).slice(0, 300)}`);
+      }
+
+      console.log("QB_TRACE respond", {
+        route: data?.route,
+        confidence: data?.confidence,
+        usedKb: data?.usedKb,
+        usedResearch: data?.usedResearch,
+        ok: data?.ok,
+      });
 
       // 5) Reload transcript from server
       router.refresh();
@@ -67,46 +104,100 @@ export default function ChatComposer({
   }
 
   return (
-    <form
-      onSubmit={onSend}
-      style={{
-        display: "flex",
-        gap: 10,
-        alignItems: "center",
-        border: "1px solid #e7e7e7",
-        borderRadius: 16,
-        padding: 10,
-      }}
-    >
-      <input
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="Type a message…"
-        disabled={loading}
+    <div style={{ display: "grid", gap: 10 }}>
+      {loading && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "10px 12px",
+            border: "1px solid #e7e7e7",
+            borderRadius: 14,
+            background: "white",
+          }}
+        >
+          <Spinner />
+          <div
+            style={{
+              fontSize: 14,
+              lineHeight: 1.25,
+              fontWeight: 800,
+              color: BRAND,
+              fontFamily:
+                "'Montserrat', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
+            }}
+          >
+            Great things are happening…
+          </div>
+        </div>
+      )}
+
+      <form
+        onSubmit={onSend}
         style={{
-          flex: 1,
-          border: "1px solid #ddd",
-          borderRadius: 12,
-          padding: "10px 12px",
-          outline: "none",
-        }}
-      />
-      <button
-        type="submit"
-        disabled={loading}
-        style={{
-          background: BRAND,
-          color: "white",
-          border: `1px solid ${BRAND}`,
-          borderRadius: 12,
-          padding: "10px 14px",
-          fontWeight: 800,
-          cursor: "pointer",
-          opacity: loading ? 0.7 : 1,
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          border: "1px solid #e7e7e7",
+          borderRadius: 16,
+          padding: 10,
         }}
       >
-        {loading ? "..." : "Send"}
-      </button>
-    </form>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Type a message…"
+          disabled={loading}
+          style={{
+            flex: 1,
+            border: "1px solid #ddd",
+            borderRadius: 12,
+            padding: "10px 12px",
+            outline: "none",
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              (e.currentTarget.form as HTMLFormElement | null)?.requestSubmit();
+            }
+          }}
+        />
+        <button
+          type="submit"
+          disabled={loading || !text.trim()}
+          style={{
+            background: BRAND,
+            color: "white",
+            border: `1px solid ${BRAND}`,
+            borderRadius: 12,
+            padding: "10px 14px",
+            fontWeight: 800,
+            cursor: loading ? "not-allowed" : "pointer",
+            opacity: loading ? 0.7 : 1,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          {loading ? (
+            <>
+              <span>Working…</span>
+              <Spinner />
+            </>
+          ) : (
+            "Send"
+          )}
+        </button>
+      </form>
+
+      <style jsx global>{`
+        @keyframes spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+      `}</style>
+    </div>
   );
 }

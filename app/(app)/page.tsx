@@ -1,8 +1,5 @@
-// app/page.tsx
 import { redirect } from "next/navigation";
 import ChatPanel from "@/app/components/ChatPanel";
-import MainHeader from "./components/MainHeader";
-import ChatHistoryButton from "./components/ChatHistoryButton";
 import { getTenantIdOrThrow } from "@/lib/tenant/getTenantId";
 
 const BRAND = "#49257a";
@@ -56,23 +53,6 @@ export default async function Home({
   }
 
   return (
-    <div className="min-h-[100dvh] w-full bg-white">
-      <div className="mx-auto flex min-h-[100dvh] w-full max-w-5xl flex-col px-3 sm:px-4">
-        <div className="sticky top-0 z-10 bg-white/80 py-3 backdrop-blur">
-          <div className="flex items-center justify-between gap-3">
-            <MainHeader />
-            <ChatHistoryButton brandColor={BRAND} />
-          </div>
-        </div>
-
-        <main className="flex flex-1 min-h-0 flex-col overflow-hidden pb-3">
-          <ChatPanel
-            threadId={threadId}
-            initialMessages={initialMessages}
-            brandColor={BRAND}
-          />
-        </main>
-      </div>
-    </div>
+    <ChatPanel threadId={threadId} initialMessages={initialMessages} brandColor={BRAND} />
   );
 }

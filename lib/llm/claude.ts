@@ -16,8 +16,9 @@ export async function callClaude(args: {
   maxTokens?: number;
 
   /**
-   * If true, ask Claude to return JSON-only.
-   * (Models that don't support it will typically ignore it.)
+   * If true, we *instruct* Claude to return JSON-only.
+   * NOTE: We do NOT send response_format because your current Messages API
+   * version rejects it.
    */
   json?: boolean;
 }): Promise<{ ok: boolean; text: string; raw?: any; error?: string }> {
@@ -36,17 +37,25 @@ export async function callClaude(args: {
         content: m.content,
       }));
 
+    // If json requested, prepend a very explicit instruction to the system prompt
+    const system =
+      (args.system ?? "") +
+      (args.json
+        ? `
+
+IMPORTANT: Output MUST be valid JSON only.
+- Do NOT wrap in \`\`\` fences.
+- Do NOT include any commentary, headers, markdown, or trailing text.
+- The first character of your response must be "{" and the last must be "}".
+`
+        : "");
+
     const body: any = {
       model,
       max_tokens,
-      system: args.system ?? "",
+      system,
       messages,
     };
-
-    if (args.json) {
-      // Best-effort strict JSON mode
-      body.response_format = { type: "json_object" };
-    }
 
     // Hard timeout to avoid hanging requests
     const ctrl = new AbortController();
