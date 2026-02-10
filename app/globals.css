@@ -1,12 +1,11 @@
 @import "tailwindcss";
-:root {
-  --oliver-purple: #49257a;
-}
 
 :root {
+  --oliver-purple: #49257a;
   --background: #ffffff;
   --foreground: #171717;
 }
+
 a {
   color: var(--oliver-purple);
 }
@@ -25,8 +24,22 @@ a {
   }
 }
 
+/* ✅ Critical for “chat fills the screen” layouts */
+html,
 body {
+  height: 100%;
+  width: 100%;
+}
+
+/* Optional but usually helpful for chat apps (prevents rubber-band bounce) */
+body {
+  margin: 0;
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* If you keep overflow-hidden on <body> in layout.tsx, this prevents weird sizing issues */
+#app-root {
+  min-height: 100%;
 }

@@ -5,8 +5,8 @@ export const metadata: Metadata = {
   title: "Oliver 2.0",
   description: "Chat-first sales copilot",
   icons: {
-    icon: "/logo.png",  // <-- change if your filename differs
-    apple: "/logo.png", // <-- change if your filename differs
+    icon: "/logo.png",
+    apple: "/logo.png",
   },
 };
 
@@ -14,14 +14,14 @@ export const viewport: Viewport = {
   themeColor: "#49257a",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body className="min-h-[100dvh] w-full overflow-x-hidden overflow-y-auto bg-white">
+        <div id="app-root" className="min-h-[100dvh] w-full">
+          {children}
+        </div>
+      </body>
     </html>
   );
 }
