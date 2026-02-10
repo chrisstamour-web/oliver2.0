@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import ChatComposer from "@/app/components/ChatComposer";
 
@@ -16,119 +16,99 @@ export default function ChatPanel({
   initialMessages,
   brandColor,
 }: {
-  threadId: string;
+  threadId: string | null;
   initialMessages: Msg[];
   brandColor: string;
 }) {
   const router = useRouter();
-  const [isClearing, setIsClearing] = useState(false);
 
-  // We render from the server-provided messages.
-  // After clearing, we refresh the route to re-fetch messages (empty).
   const messages = useMemo(() => initialMessages ?? [], [initialMessages]);
 
-  async function clearChat() {
-    const ok = confirm("Clear this chat? This cannot be undone.");
-    if (!ok) return;
-
-    try {
-      setIsClearing(true);
-
-      const res = await fetch("/api/chat/clear", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ thread_id: threadId }),
-      });
-
-      if (!res.ok) {
-        const j = await res.json().catch(() => null);
-        throw new Error(j?.error || `Clear failed (${res.status})`);
-      }
-
-      // Force server component to refetch messages
-      router.refresh();
-    } catch (e: any) {
-      alert(e?.message || "Failed to clear chat.");
-    } finally {
-      setIsClearing(false);
-    }
+  function newChat() {
+    router.push("/");
+    router.refresh();
   }
 
-  return (
-    <>
-      {/* Header row with Clear button */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          marginBottom: 10,
-        }}
-      >
-        <div style={{ fontWeight: 900, color: brandColor }}>Chat</div>
+  // Creates a thread if missing, updates URL, returns the thread id
+  const ensureThreadId = useCallback(async () => {
+    if (threadId) return threadId;
 
+    const res = await fetch("/api/chat/create-thread", { method: "POST" });
+
+    // If your backend redirects (307), fetch will follow and you may get HTML.
+    // This guard makes the error visible instead of silent.
+    const text = await res.text();
+    let j: any = {};
+    try {
+      j = JSON.parse(text);
+    } catch {
+      j = { ok: false, error: text?.slice(0, 200) || "Non-JSON response" };
+    }
+
+    if (!res.ok || !j?.ok || !j?.thread_id) {
+      const msg =
+        j?.error ||
+        `Failed to create thread (status ${res.status}). Check auth/tenant routing.`;
+      throw new Error(msg);
+    }
+
+    const tid = String(j.thread_id);
+    router.replace(`/?thread=${encodeURIComponent(tid)}`);
+    router.refresh();
+    return tid;
+  }, [threadId, router]);
+
+  return (
+    <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+      {/* Top-right actions only */}
+      <div className="mb-2 flex items-center justify-end">
         <button
           type="button"
-          onClick={clearChat}
-          disabled={isClearing || messages.length === 0}
-          style={{
-            border: "1px solid #e7e7e7",
-            background: "white",
-            borderRadius: 12,
-            padding: "8px 10px",
-            fontWeight: 900,
-            fontSize: 12,
-            cursor:
-              isClearing || messages.length === 0 ? "not-allowed" : "pointer",
-            opacity: isClearing || messages.length === 0 ? 0.55 : 1,
-          }}
-          title="Clear this chat"
+          onClick={newChat}
+          disabled={!threadId}
+          className="rounded-xl px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 active:opacity-80 disabled:cursor-not-allowed disabled:opacity-60"
+          style={{ background: brandColor }}
+          title={threadId ? "Start a new chat" : "You’re already in a new chat"}
         >
-          {isClearing ? "Clearing…" : "Clear chat"}
+          New chat
         </button>
       </div>
 
-      {/* Chat transcript */}
-      <div
-        style={{
-          border: "1px solid #e7e7e7",
-          borderRadius: 16,
-          padding: 16,
-          minHeight: 300,
-          marginBottom: 12,
-        }}
-      >
+      {/* Transcript */}
+      <div className="flex-1 min-h-0 overflow-y-auto rounded-2xl border bg-white p-4">
         {messages.length ? (
-          messages.map((m) => (
-            <div
-              key={m.id}
-              style={{
-                marginBottom: 10,
-                textAlign: m.role === "user" ? "right" : "left",
-              }}
-            >
-              <div
-                style={{
-                  display: "inline-block",
-                  background: m.role === "user" ? brandColor : "#f3f3f3",
-                  color: m.role === "user" ? "white" : "#111",
-                  padding: "8px 12px",
-                  borderRadius: 12,
-                  maxWidth: "80%",
-                  whiteSpace: "pre-wrap",
-                }}
-              >
-                {m.content}
-              </div>
-            </div>
-          ))
+          <div className="space-y-3">
+            {messages.map((m) => {
+              const isUser = m.role === "user";
+              return (
+                <div
+                  key={m.id}
+                  className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className="max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed shadow-sm"
+                    style={{
+                      background: isUser ? brandColor : "#f4f4f5",
+                      color: isUser ? "white" : "#111",
+                      borderTopRightRadius: isUser ? 6 : 16,
+                      borderTopLeftRadius: isUser ? 16 : 6,
+                    }}
+                  >
+                    {m.content}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         ) : (
-          <div style={{ opacity: 0.6 }}>Start the conversation…</div>
+          <div className="text-sm text-neutral-500">Start the conversation…</div>
         )}
       </div>
 
-      {/* Composer */}
-      <ChatComposer threadId={threadId} />
-    </>
+      {/* Composer pinned */}
+      <div className="mt-3 flex-shrink-0">
+        <ChatComposer threadId={threadId} ensureThreadId={ensureThreadId} />
+      </div>
+    </div>
   );
 }

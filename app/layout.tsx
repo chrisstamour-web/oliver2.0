@@ -5,8 +5,8 @@ export const metadata: Metadata = {
   title: "Oliver 2.0",
   description: "Chat-first sales copilot",
   icons: {
-    icon: "/logo.png",  // <-- change if your filename differs
-    apple: "/logo.png", // <-- change if your filename differs
+    icon: "/logo.png",
+    apple: "/logo.png",
   },
 };
 
@@ -21,7 +21,13 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+<body className="min-h-[100dvh] w-full overflow-x-hidden overflow-y-auto">
+
+        {/* App root wrapper: allows pages to use full height reliably */}
+        <div id="app-root" className="min-h-[100dvh] w-full">
+          {children}
+        </div>
+      </body>
     </html>
   );
 }

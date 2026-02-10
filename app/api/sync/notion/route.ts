@@ -1,3 +1,4 @@
+// app/api/sync/notion/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { notionQueryDatabase } from "@/lib/notion/client";
@@ -6,7 +7,7 @@ import { mapNotionKbPageToRow } from "@/lib/notion/mappers";
 export const runtime = "nodejs";
 
 /**
- * Manual Notion → Supabase sync endpoint
+ * Manual Notion → Supabase KB sync endpoint
  * URL (local): http://localhost:3000/api/sync/notion
  *
  * Requires env vars:
@@ -53,13 +54,14 @@ export async function GET(_req: Request) {
   const kbDb = process.env.NOTION_KB_DB_ID!;
   const admin = supabaseAdmin();
 
-  // Sync KB ITEMS
   let kbRows: any[] = [];
   try {
     const kbPages = await fetchAllNotionPages(kbDb);
     for (const p of kbPages) {
       const row = await mapNotionKbPageToRow(p);
-      if (row) kbRows.push(row);
+
+      // ✅ Guard: only upsert rows that have a conflict key
+      if (row?.source_id) kbRows.push(row);
     }
   } catch (e: any) {
     return NextResponse.json(
@@ -81,8 +83,5 @@ export async function GET(_req: Request) {
     }
   }
 
-  return NextResponse.json({
-    ok: true,
-    kb_synced: kbRows.length,
-  });
+  return NextResponse.json({ ok: true, kb_synced: kbRows.length });
 }

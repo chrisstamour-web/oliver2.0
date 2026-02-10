@@ -1,7 +1,13 @@
 // app/components/MainHeader.tsx
 import Image from "next/image";
+import { Montserrat } from "next/font/google";
 
 const BRAND = "#49257a";
+
+const montserrat = Montserrat({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+});
 
 export default function MainHeader() {
   return (
@@ -24,20 +30,21 @@ export default function MainHeader() {
           flex: "0 0 auto",
         }}
       >
-        <Image
-          src="/logo.png"
-          alt="Oliver"
-          width={38}
-          height={38}
-          priority
-        />
+        <Image src="/logo.png" alt="Oliver" width={38} height={38} priority />
       </div>
 
       <div style={{ lineHeight: 1.05 }}>
-        <div style={{ fontWeight: 900, color: BRAND, fontSize: 18 }}>
-          Oliver
-        </div>
-        <div style={{ fontSize: 13, color: "#111", marginTop: 3 }}>
+        <div style={{ fontWeight: 900, color: BRAND, fontSize: 18 }}>Oliver</div>
+
+        <div
+          className={montserrat.className}
+          style={{
+            fontSize: 13,
+            color: "#4b5563", // softer than #111 (optional but nicer)
+            marginTop: 3,
+            fontWeight: 500,
+          }}
+        >
           your Pathova Assistant
         </div>
       </div>

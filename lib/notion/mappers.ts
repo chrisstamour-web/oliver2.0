@@ -1,104 +1,124 @@
 // lib/notion/mappers.ts
 import { notionPageToMarkdown } from "./client";
 
-function propTitle(page: any, name: string): string | null {
-  const p = page?.properties?.[name];
-  const arr = p?.title ?? [];
-  const txt = arr.map((x: any) => x?.plain_text ?? "").join("").trim();
-  return txt || null;
+/* ------------------ helpers ------------------ */
+
+function getProp(page: any, name: string) {
+  return page?.properties?.[name] ?? null;
 }
 
-function propRichText(page: any, name: string): string {
-  const p = page?.properties?.[name];
-  const arr = p?.rich_text ?? [];
-  return arr.map((x: any) => x?.plain_text ?? "").join("").trim();
+function plainText(arr?: any[] | null) {
+  return (arr ?? [])
+    .map((x: any) => String(x?.plain_text ?? ""))
+    .join("")
+    .trim();
 }
 
-function propCheckbox(page: any, name: string): boolean {
-  const p = page?.properties?.[name];
-  return !!p?.checkbox;
+function selectName(p: any): string | null {
+  return p?.select?.name ?? null;
 }
 
-function propMultiSelect(page: any, name: string): string[] {
-  const p = page?.properties?.[name];
-  const arr = p?.multi_select ?? [];
-  return arr.map((x: any) => String(x?.name ?? "").trim()).filter(Boolean);
+function multiSelectNames(p: any): string[] {
+  return (p?.multi_select ?? [])
+    .map((x: any) => String(x?.name ?? "").trim())
+    .filter(Boolean);
 }
 
-function propTextAsJson(page: any, name: string): any {
-  const raw = propRichText(page, name);
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // keep it safe; don't blow up sync
-    return { _parse_error: true, raw };
+function isUuid(v: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    v
+  );
+}
+
+/**
+ * Phase normalization.
+ * Canonical storage values:
+ *  - "1"
+ *  - "1_2"  (means Phase 1 and Phase 2)
+ *  - "all"
+ *
+ * Accepts common Notion labels like:
+ *  - "1 and 2"
+ *  - "1&2"
+ *  - "1+2"
+ *  - "1_2"
+ */
+function normalizePhase(v: string | null): "1" | "1_2" | "all" {
+  const s = (v ?? "").trim().toLowerCase();
+
+  if (s === "1") return "1";
+
+  if (
+    s === "1_2" ||
+    s === "1 and 2" ||
+    s === "1&2" ||
+    s === "1 + 2" ||
+    s === "1+2"
+  ) {
+    return "1_2";
   }
+
+  return "all";
 }
 
-/**
- * NOTION DB: Agents
- * Required properties (recommended):
- * - Key (title)               e.g. "icp_fit"
- * - Title (rich_text)         human title
- * - Active (checkbox)         mark 1 version as active
- * - Input Schema (rich_text)  JSON
- * - Output Schema (rich_text) JSON
- * - Examples (rich_text)      JSON array
- * - Tags (multi_select)
- *
- * Body content of the page becomes system_prompt_md (markdown)
- */
-export async function mapNotionAgentPageToRow(page: any) {
-  const key = propTitle(page, "Key");
-  if (!key) return null;
+/* ------------------ mapper ------------------ */
 
-  const source_id = page.id;
-  const notion_last_edited_time = page.last_edited_time ?? null;
-
-  const system_prompt_md = await notionPageToMarkdown(page.id);
-
-  return {
-    tenant_id: null,
-    key,
-    version: notion_last_edited_time ?? new Date().toISOString(),
-    title: propRichText(page, "Title") || key,
-    system_prompt_md,
-    input_schema_json: propTextAsJson(page, "Input Schema"),
-    output_schema_json: propTextAsJson(page, "Output Schema"),
-    examples_json: propTextAsJson(page, "Examples"),
-    tags: propMultiSelect(page, "Tags"),
-    is_active: propCheckbox(page, "Active"),
-    source: "notion",
-    source_id,
-    notion_last_edited_time,
-  };
-}
-
-/**
- * NOTION DB: KB
- * Required properties (recommended):
- * - Title (title)
- * - Summary (rich_text)
- * - Tags (multi_select)
- *
- * Page body becomes content_md
- */
 export async function mapNotionKbPageToRow(page: any) {
-  const title = propTitle(page, "Title") ?? "Untitled";
-  const source_id = page.id;
-  const notion_last_edited_time = page.last_edited_time ?? null;
+  const source_id = page?.id;
+  if (!source_id) {
+    throw new Error("Notion page missing id");
+  }
 
-  const content_md = await notionPageToMarkdown(page.id);
+  /* -------- Tenant ID (REQUIRED) -------- */
+  const tenantRaw = plainText(getProp(page, "Tenant ID")?.rich_text);
+  if (!tenantRaw || !isUuid(tenantRaw)) {
+    throw new Error(`KB item ${source_id} missing or invalid Tenant ID`);
+  }
+
+  /* -------- Phase (default = all) -------- */
+  const phaseRaw = selectName(getProp(page, "Phase"));
+  const phase = normalizePhase(phaseRaw);
+
+  /* -------- Type (REQUIRED) -------- */
+  const kb_type = selectName(getProp(page, "Type"));
+  if (!kb_type) {
+    throw new Error(`KB item ${source_id} missing required Type`);
+  }
+
+  /* -------- Status (default = draft) -------- */
+  const statusRaw = selectName(getProp(page, "Status"));
+  const status =
+    statusRaw === "approved" || statusRaw === "deprecated"
+      ? statusRaw
+      : "draft";
+
+  /* -------- Core content -------- */
+  const title = plainText(getProp(page, "Title")?.title) || "Untitled";
+
+  const summary = plainText(getProp(page, "Summary")?.rich_text) || null;
+
+  const content_md = await notionPageToMarkdown(source_id);
+  if (!content_md) {
+    throw new Error(`KB item ${source_id} has empty content`);
+  }
+
+  /* -------- Tags -------- */
+  const tags = multiSelectNames(getProp(page, "Tags"));
 
   return {
-    tenant_id: null,
+    // IMPORTANT: do NOT include `id`
+    tenant_id: tenantRaw,
+    phase,
+    kb_type,
+    status,
+
     title,
-    summary: propRichText(page, "Summary") || null,
+    summary,
     content_md,
-    tags: propMultiSelect(page, "Tags"),
+    tags,
+
     source: "notion",
     source_id,
-    notion_last_edited_time,
+    notion_last_edited_time: page?.last_edited_time ?? null,
   };
 }

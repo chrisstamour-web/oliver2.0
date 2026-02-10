@@ -23,6 +23,48 @@ function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
 }
 
+function resolveClaudeModel(explicit?: string) {
+  const model = explicit ?? process.env.CLAUDE_MODEL;
+  if (!model) throw new Error("Missing env var: CLAUDE_MODEL");
+  return model;
+}
+
+function buildContext(recentMessages?: ChatMessage[]) {
+  // Keep context short to reduce cost + reduce injection surface.
+  return (recentMessages ?? [])
+    .slice(-6)
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join("\n")
+    .trim();
+}
+
+function tryParseJsonObject(rawText: string): { ok: true; value: any } | { ok: false } {
+  const t = (rawText ?? "").trim();
+  if (!t) return { ok: false };
+
+  // Remove common wrappers
+  const noFences = t
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  // 1) Direct parse
+  try {
+    return { ok: true, value: JSON.parse(noFences) };
+  } catch {}
+
+  // 2) Extract first {...} block
+  const match = noFences.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      return { ok: true, value: JSON.parse(match[0]) };
+    } catch {}
+  }
+
+  return { ok: false };
+}
+
 /**
  * Extract a hospital/health organization name from arbitrary user text.
  * Returns org_name=null if not confidently found.
@@ -34,22 +76,19 @@ export async function extractOrgNameWithClaude(args: {
   model?: string;
 }): Promise<OrgExtractResult> {
   const userText = (args.userText ?? "").trim();
+  const model = resolveClaudeModel(args.model);
+
   if (!userText) {
     return {
       ok: true,
       org_name: null,
       confidence: 0,
       rationale: "Empty input",
-      model: args.model ?? "unknown",
+      model,
     };
   }
 
-  // Keep context short to reduce cost + reduce injection surface.
-  const context = (args.recentMessages ?? [])
-    .slice(-6)
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
-    .join("\n");
+  const context = buildContext(args.recentMessages);
 
   const system = `
 You are an information extraction component inside a sales copilot.
@@ -74,22 +113,21 @@ Return this exact JSON shape:
 }
 `.trim();
 
-  const promptMessages: ChatMessage[] = [
-    ...(context
-      ? [
-          {
-            role: "user" as const,
-            content: `Recent chat context:\n${context}`,
-          },
-        ]
-      : []),
-    {
-      role: "user",
-      content: `User text:\n${userText}`,
-    },
-  ];
+const promptMessages: ChatMessage[] = [
+  ...(context
+    ? [
+        {
+          role: "user",
+          content: `Recent chat context:\n${context}`,
+        } satisfies ChatMessage,
+      ]
+    : []),
+  {
+    role: "user",
+    content: `User text:\n${userText}`,
+  } satisfies ChatMessage,
+];
 
-  const model = args.model ?? process.env.CLAUDE_MODEL ?? "claude-sonnet-4-5";
 
   const resp = await callClaude({
     model,
@@ -99,28 +137,13 @@ Return this exact JSON shape:
   });
 
   if (!resp.ok) {
-    return { ok: false, error: resp.error ?? "Claude failed", model };
+    return { ok: false, error: resp.error ?? "Claude failed", model, raw: resp.raw };
   }
 
-  // Strict JSON parse with fallback hard-fail (do NOT guess if parse fails).
   const rawText = (resp.text ?? "").trim();
-  let parsed: any = null;
+  const parsedAttempt = tryParseJsonObject(rawText);
 
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    // Sometimes models wrap JSON with stray text; attempt to extract first {...} block.
-    const match = rawText.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        parsed = JSON.parse(match[0]);
-      } catch {
-        parsed = null;
-      }
-    }
-  }
-
-  if (!parsed || typeof parsed !== "object") {
+  if (!parsedAttempt.ok || !parsedAttempt.value || typeof parsedAttempt.value !== "object") {
     return {
       ok: false,
       error: "Claude returned non-JSON or unparseable JSON",
@@ -128,6 +151,8 @@ Return this exact JSON shape:
       raw: { rawText },
     };
   }
+
+  const parsed = parsedAttempt.value;
 
   const org_name =
     typeof parsed.org_name === "string" ? parsed.org_name.trim() : null;
@@ -140,7 +165,7 @@ Return this exact JSON shape:
 
   // Guardrails against junk:
   const cleanOrg =
-    org_name && org_name.length <= 80 && org_name.split(" ").length <= 10
+    org_name && org_name.length <= 80 && org_name.split(/\s+/).length <= 10
       ? org_name
       : null;
 
