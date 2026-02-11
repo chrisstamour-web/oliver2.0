@@ -8,6 +8,25 @@ function mustGetEnv(name: string): string {
   return v;
 }
 
+function normalizeCitations(raw: any): { title?: string; url?: string }[] | undefined {
+  const candidates =
+    raw?.citations ??
+    raw?.choices?.[0]?.citations ??
+    raw?.choices?.[0]?.message?.citations ??
+    raw?.choices?.[0]?.message?.metadata?.citations ??
+    undefined;
+
+  if (!Array.isArray(candidates)) return undefined;
+
+  return candidates
+    .map((c: any) => ({
+      title: c?.title ?? c?.name ?? undefined,
+      url: c?.url ?? c?.link ?? undefined,
+    }))
+    .filter((c: any) => c.title || c.url)
+    .slice(0, 12);
+}
+
 /**
  * Perplexity is OpenAI-compatible for chat completions.
  * We'll request citations (if supported by the chosen model/account) and return the raw response too.
@@ -16,14 +35,21 @@ export async function callPerplexity(args: {
   messages: ChatMessage[];
   model?: string;
   maxTokens?: number;
+  temperature?: number;
 }): Promise<ResearchResult> {
   try {
     const apiKey = mustGetEnv("PERPLEXITY_API_KEY");
     const model = args.model ?? process.env.PERPLEXITY_MODEL ?? "sonar";
     const max_tokens = args.maxTokens ?? 900;
+    const temperature = typeof args.temperature === "number" ? args.temperature : 0.2;
+
+    // Hard timeout to avoid hanging requests
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 45_000);
 
     const res = await fetch(PPLX_API_URL, {
       method: "POST",
+      signal: ctrl.signal,
       headers: {
         "content-type": "application/json",
         Authorization: `Bearer ${apiKey}`,
@@ -32,13 +58,17 @@ export async function callPerplexity(args: {
         model,
         max_tokens,
         messages: args.messages.map((m) => ({ role: m.role, content: m.content })),
-        // Some Perplexity configs support returning citations automatically.
-        // Leaving this "light" and compatible; raw will still include any citations.
-        temperature: 0.2,
+        temperature,
       }),
-    });
+    }).finally(() => clearTimeout(t));
 
-    const raw = await res.json();
+    // Safely parse JSON (Perplexity can return non-JSON on some edge failures)
+    let raw: any = {};
+    try {
+      raw = await res.json();
+    } catch {
+      raw = { error: { message: "Non-JSON response from Perplexity" } };
+    }
 
     if (!res.ok) {
       return {
@@ -54,13 +84,15 @@ export async function callPerplexity(args: {
       raw?.choices?.[0]?.delta?.content ??
       "";
 
-    // If citations are present, normalize them lightly. (Many responses include a citations array.)
-    const citations = Array.isArray(raw?.citations)
-      ? raw.citations.map((c: any) => ({ title: c?.title, url: c?.url }))
-      : undefined;
+    const citations = normalizeCitations(raw);
 
     return { ok: true, answer, citations, raw };
   } catch (e: any) {
-    return { ok: false, answer: "", error: e?.message ?? "Perplexity unknown error" };
+    const msg =
+      e?.name === "AbortError"
+        ? "Perplexity request timed out"
+        : e?.message ?? "Perplexity unknown error";
+
+    return { ok: false, answer: "", error: msg };
   }
 }

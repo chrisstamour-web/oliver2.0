@@ -1,4 +1,6 @@
 // app/api/chat/respond/route.ts
+import "server-only";
+
 import { NextResponse } from "next/server";
 import { getTenantIdOrThrow } from "@/lib/tenant/getTenantId";
 import { loadMainAgent } from "@/lib/runners/mainAgent";
@@ -6,9 +8,13 @@ import { callClaude } from "@/lib/llm/claude";
 import type { ChatMessage } from "@/lib/llm/types";
 
 import { decideRouteWithQb } from "@/lib/agents/qb/qbRouter";
-import { runIcpFit } from "@/lib/runners/icpFit";
-import { callPerplexity } from "@/lib/llm/perplexity";
 
+import { runIcpFit } from "@/lib/runners/icpFit";
+import { runSalesStrategy } from "@/lib/runners/salesStrategy";
+import { runStakeholderMap } from "@/lib/runners/stakeholderMap";
+import { runDraftOutreach } from "@/lib/runners/draftOutreach";
+
+import { callPerplexity } from "@/lib/llm/perplexity";
 import { searchKb } from "@/lib/kb/searchKb";
 import { formatKbBlock } from "@/lib/kb/formatKb";
 
@@ -34,10 +40,105 @@ function lastUserText(messages: ChatMessage[]) {
   return "";
 }
 
-function buildPerplexityMessages(queries: string[]): ChatMessage[] {
-  const q = (queries ?? []).filter(Boolean).slice(0, 3).join("\n");
-  const prompt = `Research the following. Be factual and include sources/citations when available.\n\n${q}`;
-  return [{ role: "user", content: prompt }];
+// -----------------------------
+// Perplexity prompt construction
+// -----------------------------
+function buildPerplexityMessages(args: {
+  target: string; // e.g. "Meadville Medical Center, Meadville, PA"
+  extraQueries?: string[]; // route-specific hints
+}): ChatMessage[] {
+  const system = [
+    `ROLE + OBJECTIVE (STRICT)`,
+    `You are a hospital intelligence researcher.`,
+    `Collect FACTS ONLY — no scoring, analysis, or recommendations.`,
+    `Every claim MUST include a URL citation and, when possible, a short quote.`,
+    ``,
+    `EVIDENCE STANDARDS`,
+    `- CONFIRMED: verified by 2+ primary sources`,
+    `- ESTIMATED: inferred from proxies; explain proxies + reasoning`,
+    `- UNKNOWN: not found after searching; list sources checked`,
+    ``,
+    `SOURCE PRIORITY (use in order)`,
+    `1) Hospital official websites`,
+    `2) LinkedIn profiles (current role at hospital)`,
+    `3) PubMed/Google Scholar`,
+    `4) Press releases (hospital/vendor)`,
+    `5) Job postings`,
+    `6) Conference abstracts (AAPM/ASTRO/ESTRO)`,
+    `7) Local news`,
+    `8) Government databases (e.g., cancer.gov, CMS)`,
+    ``,
+    `EXCLUDED SOURCES`,
+    `- Wikipedia / general wikis`,
+    `- unverified forums`,
+    `- sales intelligence platforms (ZoomInfo/Apollo/etc.)`,
+    `- sources older than 3 years for time-sensitive claims (unless only evidence)`,
+    ``,
+    `OUTPUT RULES`,
+    `- Follow the schema exactly (single definition per field; NO duplication).`,
+    `- Prefer last 24 months for staffing/equipment/software; include dates.`,
+    `- If UNKNOWN, write UNKNOWN + sources checked.`,
+  ].join("\n");
+
+  const schema = `
+HOSPITAL INTELLIGENCE REPORT
+Hospital: ${args.target}
+
+## 1. RADIATION ONCOLOGY INFRASTRUCTURE
+TPS: Brand | Version (if Eclipse) | Evidence (URL + quote) | Confidence (CONFIRMED/ESTIMATED/UNKNOWN)
+Linacs: Varian models + qty | Non-Varian | Installation dates | Evidence (URL + quote)
+Staff: Physicists (count + names + LinkedIn URLs) | Dosimetrists | Rad Oncs | Method + Evidence URLs
+
+## 2. CLINICAL VOLUME
+Skin cancer volume: Explicit data OR estimate (bed count, NCI designation, dedicated program, physician subspecializations, reasoning, confidence) + Evidence URLs
+Mohs + radiation partnership: Yes/No/Unknown + Evidence URL
+
+## 3. INSTITUTIONAL CHARACTERISTICS
+Type | NCI designation | Med school affiliation | Residency + Evidence URLs
+Ownership | Reimbursement model (HOPD/Freestanding) | Health system + Evidence URLs
+Financial signals: Capital investments (2yr) | Equipment purchases | Distress signals + Evidence URLs
+
+## 4. KEY PERSONNEL
+Chief Medical Physicist: Name, title, LinkedIn, email, background, AAPM chapter/leadership, publications (last 3yr, up to 5), LinkedIn activity (6mo) + Evidence URLs
+Secondary: Rad Onc (skin), Dosimetry Mgr, Dept Admin, Procurement Dir — Name + LinkedIn + relevant details + Evidence URLs
+
+## 5. TRIGGER EVENTS (Last 6 Months)
+For each: Event | Date | Evidence (URL + quote)
+- Equipment purchases/installations
+- Tech upgrades
+- Staffing changes (hires + open positions)
+- LinkedIn pain signals
+- Publications
+- Strategic initiatives
+
+## 6. WORKFLOW PAIN EVIDENCE
+Job postings (last 12mo): Title | date | key language (quote) | URL
+Abstracts/publications: Citation | relevance quote | URL
+
+## 7. COMPETITIVE LANDSCAPE
+Auto-planning | Auto-contouring | 3D bolus — name or "None detected" | evidence | contract timing (if found)
+Vendor relationships | RFP/procurement activity + Evidence URLs
+
+## 8. RELATIONSHIP MAPPING
+Co-author networks | AAPM overlap | LinkedIn connections | Conference co-presentations + Evidence URLs
+
+## DATA GAPS
+Critical data NOT found + sources checked
+3–5 discovery questions to fill gaps
+
+## SOURCES CONSULTED
+Complete URL list
+`.trim();
+
+  const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 5);
+  const extraBlock = extra.length
+    ? `\n\nADDITIONAL SEARCH QUERIES (use to guide your search):\n- ${extra.join("\n- ")}`
+    : "";
+
+  return [
+    { role: "system", content: system },
+    { role: "user", content: schema + extraBlock },
+  ];
 }
 
 function formatResearchBlock(p: {
@@ -98,45 +199,70 @@ async function putCachedResearch(
   });
 }
 
-/**
- * QB handoff: short "QB Next" section to keep the conversation moving.
- */
-async function qbHandoff(args: {
-  lastUser: string;
-  specialistOutput: string;
-}): Promise<string> {
-  const system = `You are the QUARTERBACK (QB).
-Your job is to continue the conversation AFTER a specialist agent has delivered its output.
-
-Output format:
-**QB Next**
-- 2–4 bullet next steps tailored to this exact situation
-- 1 crisp next question
-
-Rules:
-- Do NOT repeat the specialist's content.
-- Keep it short and action-oriented.
-- Assume the same prospect remains in scope unless the user named a new one.
-`;
-
-  const user = `Last user message:
-${args.lastUser}
-
-Specialist output (for context only):
-${args.specialistOutput}
-
-Write the QB Next section.`;
-
-  const llm = await callClaude({
-    system,
-    messages: [{ role: "user", content: user }],
-    maxTokens: 220,
-  });
-
-  if (!llm.ok) return "";
-  const t = String(llm.text ?? "").trim();
-  return t ? `\n\n${t}` : "";
+// -----------------------------
+// Council Findings layer
+// -----------------------------
+function normalizeFindingList(v: any, limit = 8): string[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((x) => String(x ?? "").trim())
+    .filter(Boolean)
+    .slice(0, limit);
 }
+
+function buildCouncilFindings(items: Array<{ agent: string; telemetry: any | null }>): string {
+  const alerts: string[] = [];
+  const recommendations: string[] = [];
+  const assumptions: string[] = [];
+  const questions: string[] = [];
+
+  for (const it of items) {
+    const t = it.telemetry;
+    if (!t || typeof t !== "object") continue;
+
+    const a = normalizeFindingList((t as any).alerts);
+    const r = normalizeFindingList((t as any).recommendations);
+    const s = normalizeFindingList((t as any).assumptions);
+    const q = normalizeFindingList((t as any).questions);
+
+    for (const x of a) alerts.push(`[${it.agent}] ${x}`);
+    for (const x of r) recommendations.push(`[${it.agent}] ${x}`);
+    for (const x of s) assumptions.push(`[${it.agent}] ${x}`);
+    for (const x of q) questions.push(`[${it.agent}] ${x}`);
+  }
+
+  const lines: string[] = [];
+  lines.push("[Council Findings]");
+
+  if (alerts.length) {
+    lines.push("Alerts:");
+    for (const x of alerts.slice(0, 10)) lines.push(`- ${x}`);
+  }
+
+  if (recommendations.length) {
+    lines.push("\nRecommendations:");
+    for (const x of recommendations.slice(0, 10)) lines.push(`- ${x}`);
+  }
+
+  if (assumptions.length) {
+    lines.push("\nAssumptions:");
+    for (const x of assumptions.slice(0, 10)) lines.push(`- ${x}`);
+  }
+
+  if (questions.length) {
+    lines.push("\nSuggested Questions (pick ONE):");
+    for (const x of questions.slice(0, 5)) lines.push(`- ${x}`);
+  }
+
+  return lines.join("\n");
+}
+
+function safeAgentList(x: any): string[] {
+  if (!Array.isArray(x)) return [];
+  return x.map((s) => String(s)).filter(Boolean);
+}
+
+const RUNNABLE = new Set(["icpFit", "salesStrategy", "stakeholderMap", "draftOutreach", "chat"]);
 
 export async function POST(req: Request) {
   try {
@@ -156,9 +282,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "threadId required" }, { status: 400 });
     }
 
-    // =========================
-    // CHANGE #1: Load thread row
-    // =========================
+    // --- Load thread row (account linkage) ---
     const { data: threadRow, error: tErr } = await supabase
       .from("chat_threads")
       .select("id, account_id, title")
@@ -170,7 +294,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
     }
 
-    // --- load messages ---
+    // --- Load messages ---
     const { data: rows, error: mErr } = await supabase
       .from("chat_messages")
       .select("role, content, created_at")
@@ -185,9 +309,7 @@ export async function POST(req: Request) {
     const messages: ChatMessage[] = normalizeMessages((rows ?? []) as Row[]);
     const lastUser = lastUserText(messages);
 
-    // ====================================
-    // CHANGE #2: Load account + build msg
-    // ====================================
+    // --- Account memory (optional) ---
     let accountMsg: ChatMessage | null = null;
 
     if (threadRow?.account_id) {
@@ -214,33 +336,53 @@ export async function POST(req: Request) {
       }
     }
 
-    // --- QB decides (route + research intent) ---
-    const decision = await decideRouteWithQb(messages);
-    const route = decision.route ?? "chat";
+    // --- QB decides (routing + research intent) ---
+    const decision = await decideRouteWithQb({
+      messages,
+      decisionContext: {},
+      entityData: {},
+    });
+
+    const routing = (decision as any)?.routing;
+    const plannedAgents = safeAgentList(
+      routing?.priority_order?.length ? routing.priority_order : routing?.agents_to_call
+    );
+
+    const agentsToRun = plannedAgents.filter((a) => RUNNABLE.has(a));
+    const route: "chat" | "icpFit" = agentsToRun.includes("icpFit") ? "icpFit" : "chat";
 
     // --- Perplexity research (cached) ---
     let researchMsg: ChatMessage | null = null;
     let usedResearch = false;
 
-    if (decision.needsResearch && (decision.researchQueries?.length ?? 0) > 0) {
+    if ((decision as any)?.needsResearch && (((decision as any)?.researchQueries?.length ?? 0) > 0)) {
       const cacheKey = makeCacheKey({
         route,
-        queries: decision.researchQueries ?? [],
+        queries: (decision as any).researchQueries ?? [],
         lastUser,
       });
 
       const cached = await getCachedResearch(supabase, tenantId, cacheKey);
 
       if (cached?.answer) {
-        const block = formatResearchBlock({
-          answer: cached.answer,
-          citations: (cached.citations ?? []) as any[],
-        });
-        researchMsg = { role: "assistant", content: block };
+        researchMsg = {
+          role: "assistant",
+          content: formatResearchBlock({
+            answer: cached.answer,
+            citations: (cached.citations ?? []) as any[],
+          }),
+        };
         usedResearch = true;
       } else {
+        // Use the protocol prompt rather than a weak "research these" prompt.
+        const subject = lastUser || "the target hospital";
+
         const pplx = await callPerplexity({
-          messages: buildPerplexityMessages(decision.researchQueries),
+          messages: buildPerplexityMessages({
+            target: subject,
+            extraQueries: (decision as any).researchQueries ?? [],
+          }),
+          maxTokens: 2200,
         });
 
         if (pplx.ok) {
@@ -249,11 +391,13 @@ export async function POST(req: Request) {
             citations: pplx.citations ?? [],
           });
 
-          const block = formatResearchBlock({
-            answer: pplx.answer,
-            citations: pplx.citations,
-          });
-          researchMsg = { role: "assistant", content: block };
+          researchMsg = {
+            role: "assistant",
+            content: formatResearchBlock({
+              answer: pplx.answer,
+              citations: pplx.citations,
+            }),
+          };
           usedResearch = true;
         }
       }
@@ -278,9 +422,7 @@ export async function POST(req: Request) {
       usedKb = false;
     }
 
-    // ==========================================
-    // CHANGE #3: Augmented includes accountMsg
-    // ==========================================
+    // --- Augmented base messages (context injection) ---
     const augmented: ChatMessage[] = [
       ...messages,
       ...(accountMsg ? [accountMsg] : []),
@@ -288,59 +430,128 @@ export async function POST(req: Request) {
       ...(kbMsg ? [kbMsg] : []),
     ];
 
-    // --- Sub-agent path: ICP Fit (natural output) ---
-    if (route === "icpFit") {
-      const result = await runIcpFit({ tenantId, messages: augmented });
-      const icpText = String((result as any).content_text ?? "").trim();
+    // --- Run specialists -> perspectives + council findings ---
+    const perspectives: string[] = [];
+    const councilInputs: Array<{ agent: string; telemetry: any | null }> = [];
 
-      if (!icpText) {
-        return NextResponse.json(
-          { ok: false, error: "ICP Fit returned empty output" },
-          { status: 500 }
+    // NOTE: Wire entityData later from accounts/KB/patterns.
+    const entityData = {};
+
+    for (const agentId of agentsToRun) {
+      if (agentId === "chat") continue;
+
+      if (agentId === "icpFit") {
+        const r: any = await runIcpFit({ tenantId, messages: augmented, entityData });
+        const text = String(r?.content_text ?? "").trim();
+        const telemetry = r?.qb_json ?? null;
+
+        perspectives.push(
+          `[Agent Perspective: ICP Fit]\n` +
+            (text || "(empty)") +
+            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
         );
+
+        councilInputs.push({ agent: "icpFit", telemetry });
+        continue;
       }
 
-      // QB takes over after specialist output
-      const handoff = await qbHandoff({
-        lastUser,
-        specialistOutput: icpText,
-      });
+      if (agentId === "salesStrategy") {
+        const r: any = await runSalesStrategy({ tenantId, messages: augmented, entityData });
+        const text = String(r?.content_text ?? "").trim();
+        const telemetry = r?.qb_json ?? null;
 
-      const assistantText = icpText + handoff;
+        perspectives.push(
+          `[Agent Perspective: Sales Strategy]\n` +
+            (text || "(empty)") +
+            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
+        );
 
-      const { error: insErr } = await supabase.from("chat_messages").insert({
-        tenant_id: tenantId,
-        thread_id: threadId,
-        role: "assistant",
-        content: assistantText,
-      });
-
-      if (insErr) {
-        return NextResponse.json({ ok: false, error: insErr.message }, { status: 500 });
+        councilInputs.push({ agent: "salesStrategy", telemetry });
+        continue;
       }
 
-      return NextResponse.json({
-        ok: true,
-        route: "icpFit",
-        confidence: decision.confidence,
-        usedResearch,
-        usedKb,
-      });
+      if (agentId === "stakeholderMap") {
+        const r: any = await runStakeholderMap({ tenantId, messages: augmented, entityData });
+        const text = String(r?.content_text ?? "").trim();
+        const telemetry = r?.qb_json ?? null;
+
+        perspectives.push(
+          `[Agent Perspective: Stakeholder Map]\n` +
+            (text || "(empty)") +
+            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
+        );
+
+        councilInputs.push({ agent: "stakeholderMap", telemetry });
+        continue;
+      }
+
+      if (agentId === "draftOutreach") {
+        const r: any = await runDraftOutreach({
+          tenantId,
+          messages: augmented,
+          entityData,
+          channel: "email",
+        });
+
+        const text = String(r?.content_text ?? "").trim();
+        const telemetry = r?.qb_json ?? null;
+
+        perspectives.push(
+          `[Agent Perspective: Draft Outreach]\n` +
+            (text || "(empty)") +
+            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
+        );
+
+        councilInputs.push({ agent: "draftOutreach", telemetry });
+        continue;
+      }
     }
 
-    // --- Normal chat path (main agent) ---
+    const perspectiveMsg: ChatMessage | null =
+      perspectives.length > 0
+        ? {
+            role: "assistant",
+            content: `[Agent Perspectives]\n\n${perspectives.join("\n\n---\n\n")}`,
+          }
+        : null;
+
+    const councilMsg: ChatMessage | null =
+      councilInputs.length > 0
+        ? {
+            role: "assistant",
+            content: buildCouncilFindings(councilInputs),
+          }
+        : null;
+
+    const routingMsg: ChatMessage = {
+      role: "assistant",
+      content:
+        `[Routing]\n` +
+        `decision_mode: ${routing?.decision_mode}\n` +
+        `agents_to_call: ${(routing?.agents_to_call ?? []).join(", ")}\n` +
+        `priority_order: ${(routing?.priority_order ?? []).join(", ")}\n` +
+        `confidence: ${(decision as any)?.confidence}\n` +
+        `reason: ${(decision as any)?.reason}`,
+    };
+
+    const finalMessages: ChatMessage[] = [
+      ...augmented,
+      routingMsg,
+      ...(perspectiveMsg ? [perspectiveMsg] : []),
+      ...(councilMsg ? [councilMsg] : []),
+    ];
+
+    // --- Chat Agent synthesis (mainAgent.md) ---
     const agent = loadMainAgent();
 
     const llm = await callClaude({
       system: agent.systemPrompt,
-      messages: augmented,
+      messages: finalMessages,
+      maxTokens: 2000,
     });
 
     if (!llm.ok) {
-      return NextResponse.json(
-        { ok: false, error: llm.error ?? "Claude failed" },
-        { status: 502 }
-      );
+      return NextResponse.json({ ok: false, error: llm.error ?? "Claude failed" }, { status: 502 });
     }
 
     const assistantText = String(llm.text ?? "").trim();
@@ -348,6 +559,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Empty model response" }, { status: 500 });
     }
 
+    // --- Save assistant message ---
     const { error: insErr } = await supabase.from("chat_messages").insert({
       tenant_id: tenantId,
       thread_id: threadId,
@@ -361,10 +573,12 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       ok: true,
-      route: "chat",
-      confidence: decision.confidence,
+      route,
+      confidence: (decision as any).confidence,
       usedResearch,
       usedKb,
+      routing: (decision as any).routing,
+      executed_agents: agentsToRun,
     });
   } catch (e: any) {
     return NextResponse.json(
