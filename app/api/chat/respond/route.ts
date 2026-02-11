@@ -140,26 +140,35 @@ Complete URL list
     { role: "user", content: schema + extraBlock },
   ];
 }
-
 function formatResearchBlock(p: {
   answer?: string;
-  citations?: { title?: string; url?: string }[];
+  citations?: { title?: unknown; url?: unknown }[];
 }) {
   const lines: string[] = [];
   lines.push("[External Research — Perplexity]");
-  if (p.answer) lines.push(p.answer.trim());
+  if (p.answer) lines.push(String(p.answer).trim());
 
   if (p.citations?.length) {
     lines.push("\nCitations:");
     for (const c of p.citations.slice(0, 8)) {
-      const t = (c.title ?? "").trim();
-      const u = (c.url ?? "").trim();
-      lines.push(`- ${t || "Source"}: ${u}`);
+      const t = String(c?.title ?? "").trim();
+
+      // ✅ url can be string | string[] | object | null
+      const rawUrl = (c as any)?.url;
+      const url =
+        typeof rawUrl === "string"
+          ? rawUrl
+          : Array.isArray(rawUrl)
+          ? rawUrl.find((x) => typeof x === "string") ?? ""
+          : "";
+
+      lines.push(`- ${t || "Source"}: ${url.trim()}`);
     }
   }
 
   return lines.join("\n");
 }
+
 
 function makeCacheKey(input: { route: string; queries: string[]; lastUser: string }) {
   const q = (input.queries ?? []).slice(0, 3).join("|");
@@ -190,12 +199,37 @@ async function putCachedResearch(
   cacheKey: string,
   payload: { answer?: string; citations?: any[] }
 ) {
+  const citations = (payload.citations ?? [])
+    .map((c: any) => {
+      const rawTitle = c?.title;
+      const rawUrl = c?.url;
+
+      const title =
+        typeof rawTitle === "string"
+          ? rawTitle.trim()
+          : String(rawTitle ?? "").trim();
+
+      // url can be string | string[] | object | null
+      const url =
+        typeof rawUrl === "string"
+          ? rawUrl.trim()
+          : Array.isArray(rawUrl)
+          ? String(rawUrl.find((x) => typeof x === "string") ?? "").trim()
+          : "";
+
+      // Only keep citations that have at least a title or url
+      if (!title && !url) return null;
+
+      return { title, url };
+    })
+    .filter(Boolean);
+
   await supabase.from("research_cache").insert({
     tenant_id: tenantId,
     cache_key: cacheKey,
     provider: "perplexity",
-    answer: payload.answer ?? null,
-    citations: payload.citations ?? [],
+    answer: (payload.answer ?? null) ? String(payload.answer) : null,
+    citations,
   });
 }
 
