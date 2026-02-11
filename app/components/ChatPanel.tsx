@@ -24,19 +24,12 @@ export default function ChatPanel({
 
   const messages = useMemo(() => initialMessages ?? [], [initialMessages]);
 
-  function newChat() {
-    router.push("/");
-    router.refresh();
-  }
-
   // Creates a thread if missing, updates URL, returns the thread id
   const ensureThreadId = useCallback(async () => {
     if (threadId) return threadId;
 
     const res = await fetch("/api/chat/create-thread", { method: "POST" });
 
-    // If your backend redirects (307), fetch will follow and you may get HTML.
-    // This guard makes the error visible instead of silent.
     const text = await res.text();
     let j: any = {};
     try {
@@ -60,20 +53,6 @@ export default function ChatPanel({
 
   return (
     <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
-      {/* Top-right actions only */}
-      <div className="mb-2 flex items-center justify-end">
-        <button
-          type="button"
-          onClick={newChat}
-          disabled={!threadId}
-          className="rounded-xl px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 active:opacity-80 disabled:cursor-not-allowed disabled:opacity-60"
-          style={{ background: brandColor }}
-          title={threadId ? "Start a new chat" : "You’re already in a new chat"}
-        >
-          New chat
-        </button>
-      </div>
-
       {/* Transcript */}
       <div className="flex-1 min-h-0 overflow-y-auto rounded-2xl border bg-white p-4">
         {messages.length ? (

@@ -19,33 +19,107 @@ import { searchKb } from "@/lib/kb/searchKb";
 import { formatKbBlock } from "@/lib/kb/formatKb";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
+// -----------------------------
+// Timeouts + perf tuning
+// -----------------------------
+const RESEARCH_TIMEOUT_MS = 20_000; // keep under maxDuration
+const KB_TIMEOUT_MS = 3_000;
+const QB_TIMEOUT_MS = 6_000;
+const AGENT_TIMEOUT_MS = 18_000;
+const MAX_AGENT_CONCURRENCY = 3;
+
+// -----------------------------
+// Types
+// -----------------------------
 type Row = {
   role: string | null;
-  content: string | null;
+  content: any; // can be non-string in old rows
   created_at: string | null;
 };
+
+// -----------------------------
+// Small helpers
+// -----------------------------
+function toText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
 
 function normalizeMessages(rows: Row[]): ChatMessage[] {
   return (rows ?? []).map((m) => ({
     role: m.role === "assistant" ? "assistant" : "user",
-    content: String(m.content ?? ""),
+    content: toText(m.content),
   }));
 }
 
 function lastUserText(messages: ChatMessage[]) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") return toText((messages[i] as any)?.content);
   }
   return "";
+}
+
+function insertBeforeLastUser(base: ChatMessage[], insert: ChatMessage | null): ChatMessage[] {
+  if (!insert) return base;
+  const idx = [...base].map((m) => m.role).lastIndexOf("user");
+  if (idx === -1) return [insert, ...base];
+  return [...base.slice(0, idx), insert, ...base.slice(idx)];
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number
+): Promise<Array<PromiseSettledResult<T>>> {
+  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
+  let idx = 0;
+
+  async function worker() {
+    while (true) {
+      const cur = idx++;
+      if (cur >= tasks.length) return;
+      try {
+        const val = await tasks[cur]();
+        results[cur] = { status: "fulfilled", value: val };
+      } catch (err) {
+        results[cur] = { status: "rejected", reason: err };
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 // -----------------------------
 // Perplexity prompt construction
 // -----------------------------
 function buildPerplexityMessages(args: {
-  target: string; // e.g. "Meadville Medical Center, Meadville, PA"
-  extraQueries?: string[]; // route-specific hints
+  target: string;
+  extraQueries?: string[];
 }): ChatMessage[] {
   const system = [
     `ROLE + OBJECTIVE (STRICT)`,
@@ -140,10 +214,8 @@ Complete URL list
     { role: "user", content: schema + extraBlock },
   ];
 }
-function formatResearchBlock(p: {
-  answer?: string;
-  citations?: { title?: unknown; url?: unknown }[];
-}) {
+
+function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown; url?: unknown }[] }) {
   const lines: string[] = [];
   lines.push("[External Research — Perplexity]");
   if (p.answer) lines.push(String(p.answer).trim());
@@ -152,8 +224,6 @@ function formatResearchBlock(p: {
     lines.push("\nCitations:");
     for (const c of p.citations.slice(0, 8)) {
       const t = String(c?.title ?? "").trim();
-
-      // ✅ url can be string | string[] | object | null
       const rawUrl = (c as any)?.url;
       const url =
         typeof rawUrl === "string"
@@ -161,15 +231,16 @@ function formatResearchBlock(p: {
           : Array.isArray(rawUrl)
           ? rawUrl.find((x) => typeof x === "string") ?? ""
           : "";
-
-      lines.push(`- ${t || "Source"}: ${url.trim()}`);
+      lines.push(`- ${t || "Source"}: ${String(url).trim()}`);
     }
   }
 
   return lines.join("\n");
 }
 
-
+// -----------------------------
+// Research cache
+// -----------------------------
 function makeCacheKey(input: { route: string; queries: string[]; lastUser: string }) {
   const q = (input.queries ?? []).slice(0, 3).join("|");
   const u = (input.lastUser ?? "").slice(0, 200);
@@ -205,11 +276,8 @@ async function putCachedResearch(
       const rawUrl = c?.url;
 
       const title =
-        typeof rawTitle === "string"
-          ? rawTitle.trim()
-          : String(rawTitle ?? "").trim();
+        typeof rawTitle === "string" ? rawTitle.trim() : String(rawTitle ?? "").trim();
 
-      // url can be string | string[] | object | null
       const url =
         typeof rawUrl === "string"
           ? rawUrl.trim()
@@ -217,9 +285,7 @@ async function putCachedResearch(
           ? String(rawUrl.find((x) => typeof x === "string") ?? "").trim()
           : "";
 
-      // Only keep citations that have at least a title or url
       if (!title && !url) return null;
-
       return { title, url };
     })
     .filter(Boolean);
@@ -228,7 +294,7 @@ async function putCachedResearch(
     tenant_id: tenantId,
     cache_key: cacheKey,
     provider: "perplexity",
-    answer: (payload.answer ?? null) ? String(payload.answer) : null,
+    answer: payload.answer ? String(payload.answer) : null,
     citations,
   });
 }
@@ -290,9 +356,9 @@ function buildCouncilFindings(items: Array<{ agent: string; telemetry: any | nul
 
   return lines.join("\n");
 }
+
 function buildSynthesisPrompt(lastUser: string): ChatMessage {
   const u = (lastUser ?? "").trim();
-
   return {
     role: "user",
     content:
@@ -314,6 +380,43 @@ function safeAgentList(x: any): string[] {
 
 const RUNNABLE = new Set(["icpFit", "salesStrategy", "stakeholderMap", "draftOutreach", "chat"]);
 
+// -----------------------------
+// Specialist runner (single entry point per agent)
+// -----------------------------
+async function runOneAgent(args: {
+  agentId: string;
+  tenantId: string;
+  messages: ChatMessage[];
+  entityData: any;
+}): Promise<{ agentId: string; content_text: string; telemetry: any | null }> {
+  const { agentId, tenantId, messages, entityData } = args;
+
+  if (agentId === "icpFit") {
+    const r: any = await runIcpFit({ tenantId, messages, entityData });
+    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+  }
+
+  if (agentId === "salesStrategy") {
+    const r: any = await runSalesStrategy({ tenantId, messages, entityData });
+    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+  }
+
+  if (agentId === "stakeholderMap") {
+    const r: any = await runStakeholderMapping({ tenantId, messages, entityData });
+    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+  }
+
+  if (agentId === "draftOutreach") {
+    const r: any = await runDraftOutreach({ tenantId, messages, entityData, channel: "email" });
+    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+  }
+
+  return { agentId, content_text: "", telemetry: null };
+}
+
+// -----------------------------
+// Route handler
+// -----------------------------
 export async function POST(req: Request) {
   try {
     const { supabase, tenantId } = await getTenantIdOrThrow();
@@ -340,9 +443,7 @@ export async function POST(req: Request) {
       .eq("id", threadId)
       .maybeSingle();
 
-    if (tErr) {
-      return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
-    }
+    if (tErr) return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
 
     // --- Load messages ---
     const { data: rows, error: mErr } = await supabase
@@ -352,16 +453,13 @@ export async function POST(req: Request) {
       .eq("thread_id", threadId)
       .order("created_at", { ascending: true });
 
-    if (mErr) {
-      return NextResponse.json({ ok: false, error: mErr.message }, { status: 500 });
-    }
+    if (mErr) return NextResponse.json({ ok: false, error: mErr.message }, { status: 500 });
 
     const messages: ChatMessage[] = normalizeMessages((rows ?? []) as Row[]);
     const lastUser = lastUserText(messages);
 
     // --- Account memory (optional) ---
     let accountMsg: ChatMessage | null = null;
-
     if (threadRow?.account_id) {
       const { data: acct, error: aErr } = await supabase
         .from("accounts")
@@ -372,25 +470,32 @@ export async function POST(req: Request) {
 
       if (!aErr && acct) {
         const facts = acct.metadata_json ?? {};
-        const factsPretty = JSON.stringify(facts, null, 2);
-
         accountMsg = {
           role: "assistant",
           content:
             `[Account Memory]\n` +
-            `Account: ${acct.name}\n` +
-            `Last updated: ${acct.updated_at ?? "unknown"}\n` +
-            `Known facts (tenant-owned):\n${factsPretty}\n\n` +
+            `Account: ${toText(acct.name)}\n` +
+            `Last updated: ${toText(acct.updated_at ?? "unknown")}\n` +
+            `Known facts (tenant-owned):\n${JSON.stringify(facts, null, 2)}\n\n` +
             `Rules: Treat as context. Do not claim facts not present here.`,
         };
       }
     }
 
     // --- QB decides (routing + research intent) ---
-    const decision = await decideRouteWithQb({
-      messages,
-      decisionContext: {},
-      entityData: {},
+    const decision = await withTimeout(
+      decideRouteWithQb({ messages, decisionContext: {}, entityData: {} }),
+      QB_TIMEOUT_MS,
+      "QB router"
+    ).catch((err) => {
+      // Stable fallback: keep chat only if QB fails
+      return {
+        confidence: 0.2,
+        reason: `QB failed: ${toText(err?.message ?? err)}`,
+        routing: { decision_mode: "fallback", agents_to_call: ["chat"], priority_order: ["chat"] },
+        needsResearch: false,
+        researchQueries: [],
+      } as any;
     });
 
     const routing = (decision as any)?.routing;
@@ -401,212 +506,183 @@ export async function POST(req: Request) {
     const agentsToRun = plannedAgents.filter((a) => RUNNABLE.has(a));
     const route: "chat" | "icpFit" = agentsToRun.includes("icpFit") ? "icpFit" : "chat";
 
-    // --- Perplexity research (cached) ---
+    // --- Perplexity research (cached + timed) ---
     let researchMsg: ChatMessage | null = null;
     let usedResearch = false;
 
-    if ((decision as any)?.needsResearch && (((decision as any)?.researchQueries?.length ?? 0) > 0)) {
-      const cacheKey = makeCacheKey({
-        route,
-        queries: (decision as any).researchQueries ?? [],
-        lastUser,
-      });
+    const researchQueries = ((decision as any)?.researchQueries ?? []).filter(Boolean);
+    const needsResearch = Boolean((decision as any)?.needsResearch) && researchQueries.length > 0;
 
-      const cached = await getCachedResearch(supabase, tenantId, cacheKey);
+    if (needsResearch) {
+      const cacheKey = makeCacheKey({ route, queries: researchQueries, lastUser });
+
+      const cached = await withTimeout(getCachedResearch(supabase, tenantId, cacheKey), 2_000, "Research cache read")
+        .catch(() => null);
 
       if (cached?.answer) {
         researchMsg = {
           role: "assistant",
-          content: formatResearchBlock({
-            answer: cached.answer,
-            citations: (cached.citations ?? []) as any[],
-          }),
+          content: formatResearchBlock({ answer: cached.answer, citations: (cached.citations ?? []) as any[] }),
         };
         usedResearch = true;
       } else {
-        // Use the protocol prompt rather than a weak "research these" prompt.
         const subject = lastUser || "the target hospital";
 
-        const pplx = await callPerplexity({
-          messages: buildPerplexityMessages({
-            target: subject,
-            extraQueries: (decision as any).researchQueries ?? [],
+        const pplx = await withTimeout(
+          callPerplexity({
+            messages: buildPerplexityMessages({ target: subject, extraQueries: researchQueries }),
+            maxTokens: 2200,
           }),
-          maxTokens: 2200,
-        });
+          RESEARCH_TIMEOUT_MS,
+          "Perplexity research"
+        ).catch((err) => ({ ok: false, answer: "", citations: [], error: toText(err?.message ?? err) } as any));
 
-        if (pplx.ok) {
-          await putCachedResearch(supabase, tenantId, cacheKey, {
-            answer: pplx.answer,
-            citations: pplx.citations ?? [],
-          });
-
+        if (pplx?.ok) {
+          usedResearch = true;
           researchMsg = {
             role: "assistant",
-            content: formatResearchBlock({
-              answer: pplx.answer,
-              citations: pplx.citations,
-            }),
+            content: formatResearchBlock({ answer: pplx.answer, citations: pplx.citations }),
           };
-          usedResearch = true;
+
+          // best-effort cache write (never fatal)
+          void putCachedResearch(supabase, tenantId, cacheKey, {
+            answer: pplx.answer,
+            citations: pplx.citations ?? [],
+          }).catch(() => {});
         }
       }
     }
 
-    // --- KB retrieval (never fatal) ---
+    // --- KB retrieval (never fatal + timed) ---
     let kbMsg: ChatMessage | null = null;
     let usedKb = false;
 
-    try {
-      if (lastUser) {
-        const kbHits = await searchKb({ tenantId, query: lastUser, limit: 6 });
-        const kbBlock = formatKbBlock(kbHits);
+    if (lastUser?.trim()) {
+      const kbRes = await withTimeout(
+        searchKb({ tenantId, query: lastUser.slice(0, 800), limit: 6 }),
+        KB_TIMEOUT_MS,
+        "KB search"
+      ).catch(() => null);
+
+      if (kbRes?.length) {
+        const kbBlock = formatKbBlock(kbRes);
         if (kbBlock) {
           kbMsg = { role: "assistant", content: kbBlock };
           usedKb = true;
         }
       }
-    } catch (e) {
-      console.warn("KB search failed (continuing without KB):", e);
-      kbMsg = null;
-      usedKb = false;
     }
 
-    // --- Augmented base messages (context injection) ---
-    const augmented: ChatMessage[] = [
-      ...messages,
-      ...(accountMsg ? [accountMsg] : []),
-      ...(researchMsg ? [researchMsg] : []),
-      ...(kbMsg ? [kbMsg] : []),
-    ];
+    // --- Build augmented context (intelligence depth) ---
+    // Best practice: KB goes BEFORE last user message so it behaves like "retrieved context"
+    let augmented: ChatMessage[] = [...messages];
+    augmented = insertBeforeLastUser(augmented, kbMsg);
 
-    // --- Run specialists -> perspectives + council findings ---
+    // Account + research are broader context blocks -> append is fine
+    if (accountMsg) augmented = [...augmented, accountMsg];
+    if (researchMsg) augmented = [...augmented, researchMsg];
+
+    // --- Run specialists in PARALLEL (stable) ---
+    const entityData = {};
+    const specialistIds = agentsToRun.filter((a) => a !== "chat");
+
+    const specialistTasks = specialistIds.map((agentId) => async () => {
+      return await withTimeout(
+        runOneAgent({ agentId, tenantId, messages: augmented, entityData }),
+        AGENT_TIMEOUT_MS,
+        `Agent:${agentId}`
+      );
+    });
+
+    const settled = await runWithConcurrency(specialistTasks, MAX_AGENT_CONCURRENCY);
+
     const perspectives: string[] = [];
     const councilInputs: Array<{ agent: string; telemetry: any | null }> = [];
 
-    // NOTE: Wire entityData later from accounts/KB/patterns.
-    const entityData = {};
+    // If an agent fails, we record it as a Council alert (stability + transparency)
+    for (let i = 0; i < settled.length; i++) {
+      const agentId = specialistIds[i];
 
-    for (const agentId of agentsToRun) {
-      if (agentId === "chat") continue;
-
-      if (agentId === "icpFit") {
-        const r: any = await runIcpFit({ tenantId, messages: augmented, entityData });
-        const text = String(r?.content_text ?? "").trim();
-        const telemetry = r?.qb_json ?? null;
-
-        perspectives.push(
-          `[Agent Perspective: ICP Fit]\n` +
-            (text || "(empty)") +
-            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
-        );
-
-        councilInputs.push({ agent: "icpFit", telemetry });
-        continue;
-      }
-
-      if (agentId === "salesStrategy") {
-        const r: any = await runSalesStrategy({ tenantId, messages: augmented, entityData });
-        const text = String(r?.content_text ?? "").trim();
-        const telemetry = r?.qb_json ?? null;
+      const s = settled[i];
+      if (s.status === "fulfilled") {
+        const r = s.value;
+        const label =
+          r.agentId === "icpFit"
+            ? "ICP Fit"
+            : r.agentId === "salesStrategy"
+            ? "Sales Strategy"
+            : r.agentId === "stakeholderMap"
+            ? "Stakeholder Map"
+            : r.agentId === "draftOutreach"
+            ? "Draft Outreach"
+            : r.agentId;
 
         perspectives.push(
-          `[Agent Perspective: Sales Strategy]\n` +
-            (text || "(empty)") +
-            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
+          `[Agent Perspective: ${label}]\n` +
+            (r.content_text || "(empty)") +
+            (r.telemetry ? `\n\n[Telemetry]\n${JSON.stringify(r.telemetry, null, 2)}` : "")
         );
 
-        councilInputs.push({ agent: "salesStrategy", telemetry });
-        continue;
-      }
-
-      if (agentId === "stakeholderMap") {
-        const r: any = await runStakeholderMapping({ tenantId, messages: augmented, entityData });
-        const text = String(r?.content_text ?? "").trim();
-        const telemetry = r?.qb_json ?? null;
-
-        perspectives.push(
-          `[Agent Perspective: Stakeholder Map]\n` +
-            (text || "(empty)") +
-            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
-        );
-
-        councilInputs.push({ agent: "stakeholderMap", telemetry });
-        continue;
-      }
-
-      if (agentId === "draftOutreach") {
-        const r: any = await runDraftOutreach({
-          tenantId,
-          messages: augmented,
-          entityData,
-          channel: "email",
+        councilInputs.push({ agent: r.agentId, telemetry: r.telemetry ?? null });
+      } else {
+        // synthetic telemetry so council shows the failure (stability/observability)
+        councilInputs.push({
+          agent: agentId,
+          telemetry: {
+            alerts: [`Agent failed: ${toText((s.reason as any)?.message ?? s.reason)}`],
+            recommendations: [],
+            assumptions: [],
+            questions: [],
+          },
         });
-
-        const text = String(r?.content_text ?? "").trim();
-        const telemetry = r?.qb_json ?? null;
-
-        perspectives.push(
-          `[Agent Perspective: Draft Outreach]\n` +
-            (text || "(empty)") +
-            (telemetry ? `\n\n[Telemetry]\n${JSON.stringify(telemetry, null, 2)}` : "")
-        );
-
-        councilInputs.push({ agent: "draftOutreach", telemetry });
-        continue;
       }
     }
 
     const perspectiveMsg: ChatMessage | null =
       perspectives.length > 0
-        ? {
-            role: "assistant",
-            content: `[Agent Perspectives]\n\n${perspectives.join("\n\n---\n\n")}`,
-          }
+        ? { role: "assistant", content: `[Agent Perspectives]\n\n${perspectives.join("\n\n---\n\n")}` }
         : null;
 
     const councilMsg: ChatMessage | null =
       councilInputs.length > 0
-        ? {
-            role: "assistant",
-            content: buildCouncilFindings(councilInputs),
-          }
+        ? { role: "assistant", content: buildCouncilFindings(councilInputs) }
         : null;
 
     const routingMsg: ChatMessage = {
       role: "assistant",
       content:
         `[Routing]\n` +
-        `decision_mode: ${routing?.decision_mode}\n` +
-        `agents_to_call: ${(routing?.agents_to_call ?? []).join(", ")}\n` +
-        `priority_order: ${(routing?.priority_order ?? []).join(", ")}\n` +
-        `confidence: ${(decision as any)?.confidence}\n` +
-        `reason: ${(decision as any)?.reason}`,
+        `decision_mode: ${toText(routing?.decision_mode)}\n` +
+        `agents_to_call: ${(routing?.agents_to_call ?? []).map(toText).join(", ")}\n` +
+        `priority_order: ${(routing?.priority_order ?? []).map(toText).join(", ")}\n` +
+        `confidence: ${toText((decision as any)?.confidence)}\n` +
+        `reason: ${toText((decision as any)?.reason)}`,
     };
 
-const finalMessages: ChatMessage[] = [
-  ...augmented,
-  routingMsg,
-  ...(perspectiveMsg ? [perspectiveMsg] : []),
-  ...(councilMsg ? [councilMsg] : []),
-  buildSynthesisPrompt(lastUser), // ✅ ensures last message is USER
-];
+    // ✅ Ensure the last message is USER (Claude strict models)
+    const finalMessages: ChatMessage[] = [
+      ...augmented,
+      routingMsg,
+      ...(perspectiveMsg ? [perspectiveMsg] : []),
+      ...(councilMsg ? [councilMsg] : []),
+      buildSynthesisPrompt(lastUser),
+    ];
 
-// --- Chat Agent synthesis (mainAgent.md) ---
-const agent = loadMainAgent();
+    // --- Main synthesis (mainAgent.md) ---
+    const agent = loadMainAgent();
 
-const llm = await callClaude({
-  system: agent.systemPrompt,
-  messages: finalMessages,
-  maxTokens: 2000,
-});
-
+    const llm = await callClaude({
+      system: agent.systemPrompt,
+      messages: finalMessages,
+      maxTokens: 2000,
+      // model: process.env.CLAUDE_MODEL, // (optional; callClaude already reads env)
+    });
 
     if (!llm.ok) {
       return NextResponse.json({ ok: false, error: llm.error ?? "Claude failed" }, { status: 502 });
     }
 
-    const assistantText = String(llm.text ?? "").trim();
+    const assistantText = toText(llm.text ?? "").trim();
     if (!assistantText) {
       return NextResponse.json({ ok: false, error: "Empty model response" }, { status: 500 });
     }
@@ -631,6 +707,12 @@ const llm = await callClaude({
       usedKb,
       routing: (decision as any).routing,
       executed_agents: agentsToRun,
+      // helpful debug (optional):
+      specialist_results: settled.map((s, i) => ({
+        agent: specialistIds[i],
+        ok: s.status === "fulfilled",
+        error: s.status === "rejected" ? toText((s.reason as any)?.message ?? s.reason) : null,
+      })),
     });
   } catch (e: any) {
     return NextResponse.json(

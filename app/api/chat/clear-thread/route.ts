@@ -1,8 +1,16 @@
 // app/api/chat/clear-thread/route.ts
+import "server-only";
+
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
+
+function hasMissingColumnError(err: any, column: string) {
+  const msg = String(err?.message ?? "").toLowerCase();
+  return msg.includes("does not exist") && msg.includes(column.toLowerCase());
+}
 
 export async function POST(req: Request) {
   const supabase = await createSupabaseServerClient();
@@ -17,9 +25,9 @@ export async function POST(req: Request) {
 
     // 2) Input
     const body = await req.json().catch(() => ({}));
-    const thread_id = body?.thread_id;
+    const threadId = body?.thread_id;
 
-    if (!thread_id || typeof thread_id !== "string") {
+    if (!threadId || typeof threadId !== "string") {
       return NextResponse.json({ ok: false, error: "thread_id required" }, { status: 400 });
     }
 
@@ -34,38 +42,32 @@ export async function POST(req: Request) {
       console.log("KB CHECK", { count: kb?.length ?? 0, kbErr });
     }
 
-    /**
-     * 4) Security: validate ownership.
-     * Preferred: chat_threads has user_id (or owner_id) and we check it.
-     */
+    // 4) Preferred ownership check: chat_threads.user_id
     const { data: threadRow, error: threadErr } = await supabase
       .from("chat_threads")
       .select("id,user_id")
-      .eq("id", thread_id)
+      .eq("id", threadId)
       .maybeSingle();
 
-    const threadUserIdMissing =
-      threadErr?.message?.toLowerCase().includes("does not exist") &&
-      threadErr?.message?.toLowerCase().includes("user_id");
+    const threadsMissingUserId = hasMissingColumnError(threadErr, "user_id");
 
-    if (threadErr && !threadUserIdMissing) {
+    if (threadErr && !threadsMissingUserId) {
       return NextResponse.json({ ok: false, error: threadErr.message }, { status: 500 });
     }
 
-    // If chat_threads has user_id, enforce it.
-    if (!threadUserIdMissing) {
+    // If chat_threads.user_id exists, enforce it strictly
+    if (!threadsMissingUserId) {
       if (!threadRow) {
         return NextResponse.json({ ok: false, error: "thread not found" }, { status: 404 });
       }
-      if (threadRow.user_id !== userId) {
+      if ((threadRow as any).user_id !== userId) {
         return NextResponse.json({ ok: false, error: "forbidden" }, { status: 403 });
       }
 
-      // Delete all messages for this thread (ownership already checked)
       const { data, error } = await supabase
         .from("chat_messages")
         .delete()
-        .eq("thread_id", thread_id)
+        .eq("thread_id", threadId)
         .select("id");
 
       if (error) {
@@ -75,29 +77,23 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, deleted: data?.length ?? 0 });
     }
 
-    /**
-     * 5) Fallback: if chat_threads.user_id doesn't exist,
-     * try enforcing via chat_messages.user_id.
-     */
+    // 5) Fallback ownership check: chat_messages.user_id
     const { data: oneMsg, error: oneMsgErr } = await supabase
       .from("chat_messages")
       .select("id")
-      .eq("thread_id", thread_id)
+      .eq("thread_id", threadId)
       .eq("user_id", userId)
       .limit(1)
       .maybeSingle();
 
-    const missingUserIdOnMessages =
-      oneMsgErr?.message?.toLowerCase().includes("does not exist") &&
-      oneMsgErr?.message?.toLowerCase().includes("user_id");
+    const messagesMissingUserId = hasMissingColumnError(oneMsgErr, "user_id");
 
-    if (missingUserIdOnMessages) {
-      // Last resort fallback (NOT ideal): delete by thread only.
-      // Recommended fix: add user_id (or tenant_id) + RLS to prevent cross-user deletes.
+    // Last-resort fallback (NOT ideal): if neither table has user_id
+    if (messagesMissingUserId) {
       const { data, error } = await supabase
         .from("chat_messages")
         .delete()
-        .eq("thread_id", thread_id)
+        .eq("thread_id", threadId)
         .select("id");
 
       if (error) {
@@ -124,7 +120,7 @@ export async function POST(req: Request) {
     const { data, error } = await supabase
       .from("chat_messages")
       .delete()
-      .eq("thread_id", thread_id)
+      .eq("thread_id", threadId)
       .eq("user_id", userId)
       .select("id");
 

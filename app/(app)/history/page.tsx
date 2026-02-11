@@ -69,20 +69,6 @@ const { data: threads, error } = await supabase
     }
   }
 
-  async function createNewChat() {
-    "use server";
-    const { supabase: s, tenantId: tid } = await getTenantIdOrThrow();
-
-    const { data: created, error: cErr } = await s
-      .from("chat_threads")
-      .insert({ tenant_id: tid, title: "New chat" })
-      .select("id")
-      .single();
-
-    if (cErr) throw new Error(cErr.message);
-
-    redirect(`/?thread=${encodeURIComponent(created.id)}`);
-  }
 
   return (
     <div className="min-h-[100dvh] w-full bg-white">
@@ -92,24 +78,15 @@ const { data: threads, error } = await supabase
             Chat history
           </h1>
 
-          <div className="flex items-center gap-2">
-            <form action={createNewChat}>
-              <button
-                type="submit"
-                className="rounded-xl px-4 py-2 text-sm font-semibold text-white hover:opacity-90"
-                style={{ background: BRAND }}
-              >
-                New chat
-              </button>
-            </form>
+<div className="flex items-center gap-2">
+  <Link
+    href="/"
+    className="rounded-xl border px-4 py-2 text-sm font-semibold hover:bg-neutral-50"
+  >
+    Back
+  </Link>
+</div>
 
-            <Link
-              href="/"
-              className="rounded-xl border px-4 py-2 text-sm font-semibold hover:bg-neutral-50"
-            >
-              Back
-            </Link>
-          </div>
         </div>
 
         <div className="mt-6 space-y-2">
