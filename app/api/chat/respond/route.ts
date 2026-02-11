@@ -11,7 +11,7 @@ import { decideRouteWithQb } from "@/lib/agents/qb/qbRouter";
 
 import { runIcpFit } from "@/lib/runners/icpFit";
 import { runSalesStrategy } from "@/lib/runners/salesStrategy";
-import { runStakeholderMap } from "@/lib/runners/stakeholderMap";
+import { runStakeholderMapping } from "@/lib/runners/stakeholderMap";
 import { runDraftOutreach } from "@/lib/runners/draftOutreach";
 
 import { callPerplexity } from "@/lib/llm/perplexity";
@@ -471,7 +471,7 @@ export async function POST(req: Request) {
       }
 
       if (agentId === "stakeholderMap") {
-        const r: any = await runStakeholderMap({ tenantId, messages: augmented, entityData });
+        const r: any = await runStakeholderMapping({ tenantId, messages: augmented, entityData });
         const text = String(r?.content_text ?? "").trim();
         const telemetry = r?.qb_json ?? null;
 
