@@ -78,7 +78,9 @@ export default function ChatComposer({
           (data && (data.error || data.message)) ||
           (typeof raw === "string" ? raw : "") ||
           `HTTP ${resp.status}`;
-        throw new Error(`respond failed (${resp.status}): ${String(errMsg).slice(0, 300)}`);
+        throw new Error(
+          `respond failed (${resp.status}): ${String(errMsg).slice(0, 300)}`
+        );
       }
 
       console.log("QB_TRACE respond", {
@@ -114,7 +116,8 @@ export default function ChatComposer({
             padding: "10px 12px",
             border: "1px solid #e7e7e7",
             borderRadius: 14,
-            background: "white",
+            background: "var(--background)",
+            color: "var(--foreground)",
           }}
         >
           <Spinner />
@@ -142,6 +145,8 @@ export default function ChatComposer({
           border: "1px solid #e7e7e7",
           borderRadius: 16,
           padding: 10,
+          background: "var(--background)",
+          color: "var(--foreground)",
         }}
       >
         <input
@@ -155,6 +160,8 @@ export default function ChatComposer({
             borderRadius: 12,
             padding: "10px 12px",
             outline: "none",
+            background: "var(--background)",
+            color: "var(--foreground)",
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {

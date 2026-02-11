@@ -256,6 +256,22 @@ function buildCouncilFindings(items: Array<{ agent: string; telemetry: any | nul
 
   return lines.join("\n");
 }
+function buildSynthesisPrompt(lastUser: string): ChatMessage {
+  const u = (lastUser ?? "").trim();
+
+  return {
+    role: "user",
+    content:
+      `SYNTHESIS TASK\n` +
+      `You are the final chat agent. Use ALL context above (account memory, KB, research, routing, perspectives, council).\n` +
+      `Write the best possible reply to the user's most recent message.\n\n` +
+      `User's most recent message:\n` +
+      `${u || "(unknown)"}\n\n` +
+      `Rules:\n` +
+      `- Be direct and helpful.\n` +
+      `- If something is missing, ask ONE clarifying question (only if required).\n`,
+  };
+}
 
 function safeAgentList(x: any): string[] {
   if (!Array.isArray(x)) return [];
@@ -534,21 +550,23 @@ export async function POST(req: Request) {
         `reason: ${(decision as any)?.reason}`,
     };
 
-    const finalMessages: ChatMessage[] = [
-      ...augmented,
-      routingMsg,
-      ...(perspectiveMsg ? [perspectiveMsg] : []),
-      ...(councilMsg ? [councilMsg] : []),
-    ];
+const finalMessages: ChatMessage[] = [
+  ...augmented,
+  routingMsg,
+  ...(perspectiveMsg ? [perspectiveMsg] : []),
+  ...(councilMsg ? [councilMsg] : []),
+  buildSynthesisPrompt(lastUser), // ✅ ensures last message is USER
+];
 
-    // --- Chat Agent synthesis (mainAgent.md) ---
-    const agent = loadMainAgent();
+// --- Chat Agent synthesis (mainAgent.md) ---
+const agent = loadMainAgent();
 
-    const llm = await callClaude({
-      system: agent.systemPrompt,
-      messages: finalMessages,
-      maxTokens: 2000,
-    });
+const llm = await callClaude({
+  system: agent.systemPrompt,
+  messages: finalMessages,
+  maxTokens: 2000,
+});
+
 
     if (!llm.ok) {
       return NextResponse.json({ ok: false, error: llm.error ?? "Claude failed" }, { status: 502 });
