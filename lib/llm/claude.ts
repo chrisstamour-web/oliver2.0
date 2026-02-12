@@ -59,7 +59,7 @@ IMPORTANT: Output MUST be valid JSON only.
 
     // Hard timeout to avoid hanging requests
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 45_000);
+    const t = setTimeout(() => ctrl.abort(), 120_000);
 
     const res = await fetch(CLAUDE_API_URL, {
       method: "POST",

@@ -19,7 +19,7 @@ import { searchKb } from "@/lib/kb/searchKb";
 import { formatKbBlock } from "@/lib/kb/formatKb";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 // -----------------------------
 // Timeouts + perf tuning
