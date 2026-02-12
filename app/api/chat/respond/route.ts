@@ -377,6 +377,33 @@ function safeAgentList(x: any): string[] {
   if (!Array.isArray(x)) return [];
   return x.map((s) => String(s)).filter(Boolean);
 }
+function shouldRunResearch(args: {
+  route: "chat" | "icpFit";
+  lastUser: string;
+  decision: any;
+}) {
+  // 1) Only for specific route(s)
+  if (args.route !== "icpFit") return false;
+
+  // 2) QB must explicitly request it AND provide queries
+  const queries: unknown = args.decision?.researchQueries;
+  if (!args.decision?.needsResearch) return false;
+  if (!Array.isArray(queries) || queries.length === 0) return false;
+
+  // 3) Avoid research for short follow-ups (almost always not needed)
+  const u = (args.lastUser ?? "").trim();
+  if (u.length < 40) return false;
+
+  // 4) Require “research intent” keywords (tighten/adjust as you like)
+  const intent = /\b(research|find|look up|sources?|citations?|evidence|verify|who is|what is|latest|news)\b/i;
+  if (!intent.test(u)) return false;
+
+  // 5) Optional: only allow if QB confidence is high
+  const conf = Number(args.decision?.confidence ?? 0);
+  if (Number.isFinite(conf) && conf > 0 && conf < 0.7) return false;
+
+  return true;
+}
 
 const RUNNABLE = new Set(["icpFit", "salesStrategy", "stakeholderMap", "draftOutreach", "chat"]);
 
@@ -510,8 +537,16 @@ export async function POST(req: Request) {
     let researchMsg: ChatMessage | null = null;
     let usedResearch = false;
 
-    const researchQueries = ((decision as any)?.researchQueries ?? []).filter(Boolean);
-    const needsResearch = Boolean((decision as any)?.needsResearch) && researchQueries.length > 0;
+const researchQueries = ((decision as any)?.researchQueries ?? []).filter(Boolean);
+
+const needsResearch =
+  Boolean((decision as any)?.needsResearch) &&
+  researchQueries.length > 0 &&
+  // ✅ Only if user explicitly asks to "look up / verify / research"
+  /\b(research|look up|lookup|verify|source|citation|cite|link|references|latest|news|who is|what is|where is)\b/i.test(
+    lastUser ?? ""
+  );
+
 
     if (needsResearch) {
       const cacheKey = makeCacheKey({ route, queries: researchQueries, lastUser });
@@ -581,6 +616,15 @@ export async function POST(req: Request) {
     // Account + research are broader context blocks -> append is fine
     if (accountMsg) augmented = [...augmented, accountMsg];
     if (researchMsg) augmented = [...augmented, researchMsg];
+
+console.log("RESPOND_TRACE", {
+  threadId,
+  route,
+  plannedAgents,
+  agentsToRun,
+  needsResearch: (decision as any)?.needsResearch,
+  researchQueriesCount: ((decision as any)?.researchQueries?.length ?? 0),
+});
 
     // --- Run specialists in PARALLEL (stable) ---
     const entityData = {};
