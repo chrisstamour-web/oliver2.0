@@ -28,7 +28,7 @@ export type QbDecision = {
 
 function lastUserText(messages: ChatMessage[]) {
   for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
+    if (messages[i]?.role === "user") return String(messages[i]?.content ?? "");
   }
   return "";
 }
@@ -176,6 +176,83 @@ function normalizeRouting(x: any): RoutingDecision {
   return { agents_to_call: agents, decision_mode: mode, priority_order: prio.length ? prio : agents };
 }
 
+// -----------------------------
+// Research enforcement helpers
+// -----------------------------
+function uniqNonEmptyStrings(v: unknown, max = 8): string[] {
+  const arr = Array.isArray(v) ? v : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const x of arr) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function defaultResearchQueriesFromUserText(userText: string): string[] {
+  const t = (userText ?? "").trim();
+  if (!t) return [];
+
+  // Intentionally generic: works for "find names", "who to contact", "tech stack", etc.
+  // QB/researchRouter should still provide better ones; this is just a safety net.
+  return [
+    `${t} leadership team`,
+    `${t} director quality patient safety`,
+    `${t} innovation office technology assessment`,
+    `${t} procurement contact email`,
+    `${t} site:muhc.ca directory email`, // harmless even if t isn't MUHC
+  ];
+}
+
+function enforceResearchRule(input: {
+  lastUser: string;
+  needsResearch: boolean;
+  researchQueries: unknown;
+  researchReason?: string;
+}): { needsResearch: boolean; researchQueries: string[]; researchReason?: string } {
+  const { lastUser } = input;
+
+  let needsResearch = Boolean(input.needsResearch);
+  let researchQueries = uniqNonEmptyStrings(input.researchQueries, 8);
+  let researchReason = input.researchReason;
+
+  if (!needsResearch) {
+    return { needsResearch: false, researchQueries: [], researchReason };
+  }
+
+  // ✅ NON-NEGOTIABLE: needsResearch => at least 3 queries
+  if (researchQueries.length >= 3) {
+    return { needsResearch: true, researchQueries, researchReason };
+  }
+
+  // Fill with fallback queries derived from the latest user message
+  const fallback = defaultResearchQueriesFromUserText(lastUser);
+  researchQueries = uniqNonEmptyStrings([...researchQueries, ...fallback], 8);
+
+  if (researchQueries.length >= 3) {
+    researchReason = researchReason
+      ? `${researchReason} (auto-filled missing researchQueries)`
+      : "Auto-filled missing researchQueries (QB enforcement).";
+    return { needsResearch: true, researchQueries, researchReason };
+  }
+
+  // If we still can't produce enough queries, flip off research
+  return {
+    needsResearch: false,
+    researchQueries: [],
+    researchReason: researchReason
+      ? `${researchReason} (disabled: insufficient researchQueries)`
+      : "Disabled research: insufficient researchQueries.",
+  };
+}
+
 export async function decideRouteWithQb(args: {
   messages: ChatMessage[];
   decisionContext?: any;
@@ -195,15 +272,27 @@ export async function decideRouteWithQb(args: {
 
   // --- HARD ROUTES ---
   if (isInIcpContext(messages) && looksLikeFollowUp(last) && followUpLooksIcpRelevant(last)) {
-    routing = { agents_to_call: ["icpFit", "salesStrategy"], decision_mode: "rules", priority_order: ["icpFit", "salesStrategy"] };
+    routing = {
+      agents_to_call: ["icpFit", "salesStrategy"],
+      decision_mode: "rules",
+      priority_order: ["icpFit", "salesStrategy"],
+    };
     confidence = 0.9;
     reason = "Continuity: ICP-relevant follow-up within active ICP context.";
   } else if (looksLikeTargetAccountName(last)) {
-    routing = { agents_to_call: ["icpFit", "salesStrategy"], decision_mode: "rules", priority_order: ["icpFit", "salesStrategy"] };
+    routing = {
+      agents_to_call: ["icpFit", "salesStrategy"],
+      decision_mode: "rules",
+      priority_order: ["icpFit", "salesStrategy"],
+    };
     confidence = 0.9;
     reason = "Heuristic: latest message looks like a target account name.";
   } else if (shouldRunIcpFit(messages)) {
-    routing = { agents_to_call: ["icpFit", "salesStrategy"], decision_mode: "judgment", priority_order: ["icpFit", "salesStrategy"] };
+    routing = {
+      agents_to_call: ["icpFit", "salesStrategy"],
+      decision_mode: "judgment",
+      priority_order: ["icpFit", "salesStrategy"],
+    };
     confidence = 0.82;
     reason = "Keyword heuristic: user appears to be requesting ICP fit scoring.";
   } else {
@@ -249,7 +338,6 @@ export async function decideRouteWithQb(args: {
 
       routing = normalizeRouting(parsed);
 
-      // If router didn't provide confidence, default
       const inferred = parsed?.confidence;
       confidence = inferred === undefined ? 0.65 : clamp01(inferred);
       reason = String(parsed?.reason ?? "RouterAgent decision");
@@ -262,7 +350,7 @@ export async function decideRouteWithQb(args: {
     }
   }
 
-  // --- Research decision (unchanged) ---
+  // --- Research decision (QB is boss) ---
   const r = await decideResearchWithClaude({ messages });
 
   if (!r.ok) {
@@ -276,12 +364,20 @@ export async function decideRouteWithQb(args: {
     };
   }
 
+  // ✅ ENFORCE: needsResearch => >= 3 queries
+  const enforced = enforceResearchRule({
+    lastUser: last,
+    needsResearch: Boolean(r.decision.needs_research),
+    researchReason: r.decision.reason,
+    researchQueries: r.decision.queries ?? [],
+  });
+
   return {
     routing,
     confidence,
     reason,
-    needsResearch: Boolean(r.decision.needs_research),
-    researchReason: r.decision.reason,
-    researchQueries: r.decision.queries ?? [],
+    needsResearch: enforced.needsResearch,
+    researchReason: enforced.researchReason,
+    researchQueries: enforced.researchQueries,
   };
 }

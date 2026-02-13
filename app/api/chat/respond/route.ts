@@ -117,10 +117,7 @@ async function runWithConcurrency<T>(
 // -----------------------------
 // Perplexity prompt construction
 // -----------------------------
-function buildPerplexityMessages(args: {
-  target: string;
-  extraQueries?: string[];
-}): ChatMessage[] {
+function buildPerplexityMessages(args: { target: string; extraQueries?: string[] }): ChatMessage[] {
   const system = [
     `ROLE + OBJECTIVE (STRICT)`,
     `You are a hospital intelligence researcher.`,
@@ -215,6 +212,56 @@ Complete URL list
   ];
 }
 
+// -----------------------------
+// Contact-finding research (Perplexity)
+// -----------------------------
+function isContactLookupIntent(text: string) {
+  const t = (text ?? "").toLowerCase();
+  return /\b(name|names|contact|contacts|email|e-mail|linkedin|reach out|who should i contact|who do i contact|who do i email)\b/i.test(
+    t
+  );
+}
+
+function buildContactResearchQueries(org: string) {
+  const o = (org ?? "").trim() || "McGill University Health Centre";
+  return [
+    `${o} Director Quality Patient Safety`,
+    `${o} patient safety leadership`,
+    `${o} Health Technology Assessment director`,
+    `${o} technology assessment unit`,
+    `${o} innovation office director`,
+    `${o} Chief Medical Officer`,
+    `${o} VP Clinical Programs`,
+    `${o} site:muhc.ca leadership`,
+  ];
+}
+
+function buildPerplexityContactMessages(args: { org: string }): ChatMessage[] {
+  const system = [
+    `You are a contact-finding researcher.`,
+    `Find REAL people (names + titles) for the target organization.`,
+    `Do NOT guess or fabricate names or emails.`,
+    `If an email is not explicitly present in a source, write email as UNKNOWN.`,
+    `Every contact must include at least one evidence URL (prefer official pages or LinkedIn).`,
+    `Return max 8 contacts.`,
+  ].join("\n");
+
+  const user = [
+    `TARGET ORG: ${args.org}`,
+    ``,
+    `Return exactly this format (one per line):`,
+    `- Name | Title | Org | Email (only if explicitly found) | LinkedIn URL | Evidence URL`,
+    ``,
+    `Prioritize: Quality & Patient Safety, Technology Assessment/Innovation, Clinical leadership relevant to evaluation.`,
+    `If you can’t find enough names, include a section "SEARCH STRINGS" with 8 Google/LinkedIn queries.`,
+  ].join("\n");
+
+  return [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+}
+
 function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown; url?: unknown }[] }) {
   const lines: string[] = [];
   lines.push("[External Research — Perplexity]");
@@ -275,8 +322,7 @@ async function putCachedResearch(
       const rawTitle = c?.title;
       const rawUrl = c?.url;
 
-      const title =
-        typeof rawTitle === "string" ? rawTitle.trim() : String(rawTitle ?? "").trim();
+      const title = typeof rawTitle === "string" ? rawTitle.trim() : String(rawTitle ?? "").trim();
 
       const url =
         typeof rawUrl === "string"
@@ -377,38 +423,11 @@ function safeAgentList(x: any): string[] {
   if (!Array.isArray(x)) return [];
   return x.map((s) => String(s)).filter(Boolean);
 }
-function shouldRunResearch(args: {
-  route: "chat" | "icpFit";
-  lastUser: string;
-  decision: any;
-}) {
-  // 1) Only for specific route(s)
-  if (args.route !== "icpFit") return false;
-
-  // 2) QB must explicitly request it AND provide queries
-  const queries: unknown = args.decision?.researchQueries;
-  if (!args.decision?.needsResearch) return false;
-  if (!Array.isArray(queries) || queries.length === 0) return false;
-
-  // 3) Avoid research for short follow-ups (almost always not needed)
-  const u = (args.lastUser ?? "").trim();
-  if (u.length < 40) return false;
-
-  // 4) Require “research intent” keywords (tighten/adjust as you like)
-  const intent = /\b(research|find|look up|sources?|citations?|evidence|verify|who is|what is|latest|news)\b/i;
-  if (!intent.test(u)) return false;
-
-  // 5) Optional: only allow if QB confidence is high
-  const conf = Number(args.decision?.confidence ?? 0);
-  if (Number.isFinite(conf) && conf > 0 && conf < 0.7) return false;
-
-  return true;
-}
 
 const RUNNABLE = new Set(["icpFit", "salesStrategy", "stakeholderMap", "draftOutreach", "chat"]);
 
 // -----------------------------
-// Specialist runner (single entry point per agent)
+// Specialist runner
 // -----------------------------
 async function runOneAgent(args: {
   agentId: string;
@@ -446,15 +465,8 @@ async function runOneAgent(args: {
 // -----------------------------
 export async function POST(req: Request) {
   try {
-    const { supabase, tenantId } = await getTenantIdOrThrow();
+    const { supabase, tenantId, user } = await getTenantIdOrThrow();
 
-    // --- auth ---
-    const { data: authData, error: authErr } = await supabase.auth.getUser();
-    if (authErr || !authData?.user) {
-      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
-    }
-
-    // --- input ---
     const body = await req.json().catch(() => ({}));
     const threadId = body?.threadId;
 
@@ -462,7 +474,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "threadId required" }, { status: 400 });
     }
 
-    // --- Load thread row (account linkage) ---
+    // RLS enforces ownership on the server client
     const { data: threadRow, error: tErr } = await supabase
       .from("chat_threads")
       .select("id, account_id, title")
@@ -471,8 +483,8 @@ export async function POST(req: Request) {
       .maybeSingle();
 
     if (tErr) return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
+    if (!threadRow) return NextResponse.json({ ok: false, error: "not_found" }, { status: 404 });
 
-    // --- Load messages ---
     const { data: rows, error: mErr } = await supabase
       .from("chat_messages")
       .select("role, content, created_at")
@@ -485,7 +497,7 @@ export async function POST(req: Request) {
     const messages: ChatMessage[] = normalizeMessages((rows ?? []) as Row[]);
     const lastUser = lastUserText(messages);
 
-    // --- Account memory (optional) ---
+    // Account memory (optional)
     let accountMsg: ChatMessage | null = null;
     if (threadRow?.account_id) {
       const { data: acct, error: aErr } = await supabase
@@ -509,16 +521,15 @@ export async function POST(req: Request) {
       }
     }
 
-    // --- QB decides (routing + research intent) ---
+    // QB routing
     const decision = await withTimeout(
       decideRouteWithQb({ messages, decisionContext: {}, entityData: {} }),
       QB_TIMEOUT_MS,
       "QB router"
     ).catch((err) => {
-      // Stable fallback: keep chat only if QB fails
       return {
         confidence: 0.2,
-        reason: `QB failed: ${toText(err?.message ?? err)}`,
+        reason: `QB failed: ${toText((err as any)?.message ?? err)}`,
         routing: { decision_mode: "fallback", agents_to_call: ["chat"], priority_order: ["chat"] },
         needsResearch: false,
         researchQueries: [],
@@ -533,62 +544,80 @@ export async function POST(req: Request) {
     const agentsToRun = plannedAgents.filter((a) => RUNNABLE.has(a));
     const route: "chat" | "icpFit" = agentsToRun.includes("icpFit") ? "icpFit" : "chat";
 
-    // --- Perplexity research (cached + timed) ---
-    let researchMsg: ChatMessage | null = null;
-    let usedResearch = false;
+    // -----------------------------
+   // -----------------------------
+// Perplexity research (cached + timed)
+// QB is the ONLY boss of research: it decides needsResearch + provides queries.
+// -----------------------------
+let researchMsg: ChatMessage | null = null;
+let usedResearch = false;
 
-const researchQueries = ((decision as any)?.researchQueries ?? []).filter(Boolean);
+const researchQueries = Array.isArray((decision as any)?.researchQueries)
+  ? ((decision as any).researchQueries as any[]).map((q) => String(q ?? "").trim()).filter(Boolean)
+  : [];
 
-const needsResearch =
-  Boolean((decision as any)?.needsResearch) &&
-  researchQueries.length > 0 &&
-  // ✅ Only if user explicitly asks to "look up / verify / research"
-  /\b(research|look up|lookup|verify|source|citation|cite|link|references|latest|news|who is|what is|where is)\b/i.test(
-    lastUser ?? ""
-  );
+const needsResearch = Boolean((decision as any)?.needsResearch);
 
+// ✅ safety backstop: if QB says "research" but gives < 3 queries, don't run
+const canRunResearch = needsResearch && researchQueries.length >= 3;
 
-    if (needsResearch) {
-      const cacheKey = makeCacheKey({ route, queries: researchQueries, lastUser });
+if (canRunResearch) {
+  const cacheKey = makeCacheKey({ route, queries: researchQueries, lastUser });
 
-      const cached = await withTimeout(getCachedResearch(supabase, tenantId, cacheKey), 2_000, "Research cache read")
-        .catch(() => null);
+  const cached = await withTimeout(
+    getCachedResearch(supabase, tenantId, cacheKey),
+    2_000,
+    "Research cache read"
+  ).catch(() => null);
 
-      if (cached?.answer) {
-        researchMsg = {
-          role: "assistant",
-          content: formatResearchBlock({ answer: cached.answer, citations: (cached.citations ?? []) as any[] }),
-        };
-        usedResearch = true;
-      } else {
-        const subject = lastUser || "the target hospital";
+  if (cached?.answer) {
+    usedResearch = true;
+    researchMsg = {
+      role: "assistant",
+      content: formatResearchBlock({
+        answer: cached.answer,
+        citations: (cached.citations ?? []) as any[],
+      }),
+    };
+  } else {
+    const subject = lastUser || "the target hospital";
 
-        const pplx = await withTimeout(
-          callPerplexity({
-            messages: buildPerplexityMessages({ target: subject, extraQueries: researchQueries }),
-            maxTokens: 2200,
-          }),
-          RESEARCH_TIMEOUT_MS,
-          "Perplexity research"
-        ).catch((err) => ({ ok: false, answer: "", citations: [], error: toText(err?.message ?? err) } as any));
+    const pplx = await withTimeout(
+      callPerplexity({
+        messages: buildPerplexityMessages({
+          target: subject,
+          extraQueries: researchQueries,
+        }),
+        maxTokens: 2200,
+      }),
+      RESEARCH_TIMEOUT_MS,
+      "Perplexity research"
+    ).catch((err) => ({
+      ok: false,
+      answer: "",
+      citations: [],
+      error: toText((err as any)?.message ?? err),
+    }));
 
-        if (pplx?.ok) {
-          usedResearch = true;
-          researchMsg = {
-            role: "assistant",
-            content: formatResearchBlock({ answer: pplx.answer, citations: pplx.citations }),
-          };
+    if (pplx?.ok) {
+      usedResearch = true;
+      researchMsg = {
+        role: "assistant",
+        content: formatResearchBlock({ answer: pplx.answer, citations: pplx.citations }),
+      };
 
-          // best-effort cache write (never fatal)
-          void putCachedResearch(supabase, tenantId, cacheKey, {
-            answer: pplx.answer,
-            citations: pplx.citations ?? [],
-          }).catch(() => {});
-        }
-      }
+      void putCachedResearch(supabase, tenantId, cacheKey, {
+        answer: pplx.answer,
+        citations: pplx.citations ?? [],
+      }).catch(() => {});
     }
+  }
+}
 
-    // --- KB retrieval (never fatal + timed) ---
+
+    // -----------------------------
+    // KB retrieval (never fatal + timed)
+    // -----------------------------
     let kbMsg: ChatMessage | null = null;
     let usedKb = false;
 
@@ -608,12 +637,12 @@ const needsResearch =
       }
     }
 
-    // --- Build augmented context (intelligence depth) ---
-    // Best practice: KB goes BEFORE last user message so it behaves like "retrieved context"
+    // -----------------------------
+    // Build augmented context
+    // -----------------------------
     let augmented: ChatMessage[] = [...messages];
     augmented = insertBeforeLastUser(augmented, kbMsg);
 
-    // Account + research are broader context blocks -> append is fine
     if (accountMsg) augmented = [...augmented, accountMsg];
     if (researchMsg) augmented = [...augmented, researchMsg];
 
@@ -622,11 +651,14 @@ console.log("RESPOND_TRACE", {
   route,
   plannedAgents,
   agentsToRun,
-  needsResearch: (decision as any)?.needsResearch,
-  researchQueriesCount: ((decision as any)?.researchQueries?.length ?? 0),
+  needsResearch,
+  researchQueriesCount: researchQueries.length,
 });
 
-    // --- Run specialists in PARALLEL (stable) ---
+
+    // -----------------------------
+    // Run specialists
+    // -----------------------------
     const entityData = {};
     const specialistIds = agentsToRun.filter((a) => a !== "chat");
 
@@ -643,11 +675,10 @@ console.log("RESPOND_TRACE", {
     const perspectives: string[] = [];
     const councilInputs: Array<{ agent: string; telemetry: any | null }> = [];
 
-    // If an agent fails, we record it as a Council alert (stability + transparency)
     for (let i = 0; i < settled.length; i++) {
       const agentId = specialistIds[i];
-
       const s = settled[i];
+
       if (s.status === "fulfilled") {
         const r = s.value;
         const label =
@@ -669,7 +700,6 @@ console.log("RESPOND_TRACE", {
 
         councilInputs.push({ agent: r.agentId, telemetry: r.telemetry ?? null });
       } else {
-        // synthetic telemetry so council shows the failure (stability/observability)
         councilInputs.push({
           agent: agentId,
           telemetry: {
@@ -688,14 +718,13 @@ console.log("RESPOND_TRACE", {
         : null;
 
     const councilMsg: ChatMessage | null =
-      councilInputs.length > 0
-        ? { role: "assistant", content: buildCouncilFindings(councilInputs) }
-        : null;
+      councilInputs.length > 0 ? { role: "assistant", content: buildCouncilFindings(councilInputs) } : null;
 
+    // Mark internal blocks clearly so the main agent doesn't echo them
     const routingMsg: ChatMessage = {
       role: "assistant",
       content:
-        `[Routing]\n` +
+        `[INTERNAL_ROUTING_DO_NOT_RENDER]\n` +
         `decision_mode: ${toText(routing?.decision_mode)}\n` +
         `agents_to_call: ${(routing?.agents_to_call ?? []).map(toText).join(", ")}\n` +
         `priority_order: ${(routing?.priority_order ?? []).map(toText).join(", ")}\n` +
@@ -703,7 +732,6 @@ console.log("RESPOND_TRACE", {
         `reason: ${toText((decision as any)?.reason)}`,
     };
 
-    // ✅ Ensure the last message is USER (Claude strict models)
     const finalMessages: ChatMessage[] = [
       ...augmented,
       routingMsg,
@@ -712,14 +740,15 @@ console.log("RESPOND_TRACE", {
       buildSynthesisPrompt(lastUser),
     ];
 
-    // --- Main synthesis (mainAgent.md) ---
+    // -----------------------------
+    // Main synthesis
+    // -----------------------------
     const agent = loadMainAgent();
 
     const llm = await callClaude({
       system: agent.systemPrompt,
       messages: finalMessages,
       maxTokens: 2000,
-      // model: process.env.CLAUDE_MODEL, // (optional; callClaude already reads env)
     });
 
     if (!llm.ok) {
@@ -731,12 +760,13 @@ console.log("RESPOND_TRACE", {
       return NextResponse.json({ ok: false, error: "Empty model response" }, { status: 500 });
     }
 
-    // --- Save assistant message ---
+    // Save assistant message (include user_id for consistency)
     const { error: insErr } = await supabase.from("chat_messages").insert({
       tenant_id: tenantId,
       thread_id: threadId,
       role: "assistant",
       content: assistantText,
+      user_id: user.id,
     });
 
     if (insErr) {
@@ -751,7 +781,6 @@ console.log("RESPOND_TRACE", {
       usedKb,
       routing: (decision as any).routing,
       executed_agents: agentsToRun,
-      // helpful debug (optional):
       specialist_results: settled.map((s, i) => ({
         agent: specialistIds[i],
         ok: s.status === "fulfilled",
@@ -759,9 +788,6 @@ console.log("RESPOND_TRACE", {
       })),
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? "Unknown server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message ?? "Unknown server error" }, { status: 500 });
   }
 }
