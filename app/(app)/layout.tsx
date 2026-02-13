@@ -1,16 +1,14 @@
+// app/(app)/layout.tsx
+import "server-only";
+import type { ReactNode } from "react";
 import MainHeader from "@/app/components/MainHeader";
 
-export default function AppLayout({ children }: { children: React.ReactNode }) {
+export default function AppLayout({ children }: { children: ReactNode }) {
   return (
-    <div className="min-h-[100dvh] w-full bg-white">
-      <div className="mx-auto flex min-h-[100dvh] w-full max-w-5xl flex-col px-3 sm:px-4">
-        <div className="sticky top-0 z-50 bg-white/80 py-3 backdrop-blur">
-          <MainHeader />
-        </div>
-
-        <main className="flex flex-1 min-h-0 flex-col overflow-hidden pb-3">
-          {children}
-        </main>
+    <div className="h-screen w-full bg-slate-50">
+      <div className="flex h-full flex-col">
+        <MainHeader />
+        <main className="flex-1 overflow-hidden">{children}</main>
       </div>
     </div>
   );

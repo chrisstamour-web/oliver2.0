@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useMemo, useState, useCallback } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { createSupabaseBrowserClient } from "@/lib/supabase/browser";
 
 const BRAND = "#49257a";
@@ -40,73 +40,40 @@ function MicrosoftIcon() {
   );
 }
 
+/**
+ * Prefer an env-based site URL in prod so OAuth never falls back to localhost.
+ * Set NEXT_PUBLIC_SITE_URL in Vercel to: https://app.pathovagtm.com
+ */
+function getCallbackUrl() {
+  if (typeof window === "undefined") return "/auth/callback";
+
+  const envSite = (process.env.NEXT_PUBLIC_SITE_URL ?? "").trim();
+  const origin = envSite || window.location.origin;
+
+  return `${origin.replace(/\/$/, "")}/auth/callback`;
+}
+
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
+
+  // If you ever pass ?next=/somewhere, we preserve it through OAuth.
+  const next = searchParams.get("next") ?? "/";
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-const callbackUrl = useMemo(() => {
-  if (typeof window === "undefined") return "/auth/callback";
-  return `${window.location.origin}/auth/callback`;
-}, []);
-
-
-  async function signIn(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setLoading(true);
-
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-
-    setLoading(false);
-    if (error) return setError(error.message);
-
-    router.push("/");
-    router.refresh();
-  }
-
-  async function signUp(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setLoading(true);
-
-    const { error } = await supabase.auth.signUp({ email, password });
-
-    setLoading(false);
-    if (error) return setError(error.message);
-
-    alert("Account created. If email confirmation is enabled, check your inbox.");
-  }
-
-  async function signInWithGoogle() {
-    setError(null);
-    setLoading(true);
-
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: callbackUrl },
-    });
-
-    if (error) setError(error.message);
-    setLoading(false);
-  }
-
-  async function signInWithMicrosoft() {
-    setError(null);
-    setLoading(true);
-
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "azure",
-      options: { redirectTo: callbackUrl },
-    });
-
-    if (error) setError(error.message);
-    setLoading(false);
-  }
+  // include next in the callback so the server callback route can redirect properly
+  const callbackUrl = useMemo(() => {
+    const base = getCallbackUrl();
+    const u = new URL(base, typeof window !== "undefined" ? window.location.origin : "http://localhost");
+    u.searchParams.set("next", next);
+    return u.toString();
+  }, [next]);
 
   const inputStyle: React.CSSProperties = {
     border: "1px solid #ddd",
@@ -127,16 +94,69 @@ const callbackUrl = useMemo(() => {
     gap: 10,
   };
 
+  const signIn = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      setError(null);
+      setLoading(true);
+
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+
+      setLoading(false);
+      if (error) return setError(error.message);
+
+      router.push(next);
+      router.refresh();
+    },
+    [supabase, email, password, router, next]
+  );
+
+  const signUp = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      setError(null);
+      setLoading(true);
+
+      const { error } = await supabase.auth.signUp({ email, password });
+
+      setLoading(false);
+      if (error) return setError(error.message);
+
+      alert("Account created. If email confirmation is enabled, check your inbox.");
+    },
+    [supabase, email, password]
+  );
+
+  const signInWithGoogle = useCallback(async () => {
+    setError(null);
+    setLoading(true);
+
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: callbackUrl },
+    });
+
+    if (error) setError(error.message);
+    setLoading(false);
+  }, [supabase, callbackUrl]);
+
+  const signInWithMicrosoft = useCallback(async () => {
+    setError(null);
+    setLoading(true);
+
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "azure",
+      options: { redirectTo: callbackUrl },
+    });
+
+    if (error) setError(error.message);
+    setLoading(false);
+  }, [supabase, callbackUrl]);
+
   return (
     <main style={{ maxWidth: 420, margin: "56px auto", padding: 16 }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18 }}>
-        <img
-          src="/logo.png"
-          alt="Oliver"
-          width={34}
-          height={34}
-          style={{ borderRadius: 10 }}
-        />
+        <img src="/logo.png" alt="Oliver" width={34} height={34} style={{ borderRadius: 10 }} />
         <div style={{ lineHeight: 1.1 }}>
           <div style={{ fontSize: 18, fontWeight: 900, color: BRAND }}>Oliver 2.0</div>
           <div style={{ fontSize: 13, opacity: 0.75 }}>Sign in to continue</div>
@@ -149,7 +169,7 @@ const callbackUrl = useMemo(() => {
             type="button"
             onClick={signInWithGoogle}
             disabled={loading}
-            style={{ ...btn, background: "white", color: "#111" }}
+            style={{ ...btn, background: "white", color: "#111", opacity: loading ? 0.7 : 1 }}
           >
             <GoogleIcon />
             Continue with Google
@@ -159,7 +179,7 @@ const callbackUrl = useMemo(() => {
             type="button"
             onClick={signInWithMicrosoft}
             disabled={loading}
-            style={{ ...btn, background: "white", color: "#111" }}
+            style={{ ...btn, background: "white", color: "#111", opacity: loading ? 0.7 : 1 }}
           >
             <MicrosoftIcon />
             Continue with Microsoft
@@ -183,6 +203,7 @@ const callbackUrl = useMemo(() => {
               style={inputStyle}
               onFocus={(e) => (e.currentTarget.style.borderColor = BRAND)}
               onBlur={(e) => (e.currentTarget.style.borderColor = "#ddd")}
+              autoComplete="email"
             />
           </label>
 
@@ -196,6 +217,7 @@ const callbackUrl = useMemo(() => {
               style={inputStyle}
               onFocus={(e) => (e.currentTarget.style.borderColor = BRAND)}
               onBlur={(e) => (e.currentTarget.style.borderColor = "#ddd")}
+              autoComplete="current-password"
             />
           </label>
 
@@ -243,6 +265,10 @@ const callbackUrl = useMemo(() => {
           >
             Create account
           </button>
+
+          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75, lineHeight: 1.4 }}>
+            OAuth callback: <span style={{ fontFamily: "monospace" }}>{callbackUrl}</span>
+          </div>
         </form>
       </div>
     </main>

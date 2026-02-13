@@ -6,6 +6,8 @@ import { getTenantIdOrThrow } from "@/lib/tenant/getTenantId";
 import { loadMainAgent } from "@/lib/runners/mainAgent";
 import { callClaude } from "@/lib/llm/claude";
 import type { ChatMessage } from "@/lib/llm/types";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+
 
 import { decideRouteWithQb } from "@/lib/agents/qb/qbRouter";
 
@@ -61,12 +63,16 @@ function normalizeMessages(rows: Row[]): ChatMessage[] {
 
 function lastUserText(messages: ChatMessage[]) {
   for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return toText((messages[i] as any)?.content);
+    if (messages[i]?.role === "user")
+      return toText((messages[i] as any)?.content);
   }
   return "";
 }
 
-function insertBeforeLastUser(base: ChatMessage[], insert: ChatMessage | null): ChatMessage[] {
+function insertBeforeLastUser(
+  base: ChatMessage[],
+  insert: ChatMessage | null
+): ChatMessage[] {
   if (!insert) return base;
   const idx = [...base].map((m) => m.role).lastIndexOf("user");
   if (idx === -1) return [insert, ...base];
@@ -75,7 +81,10 @@ function insertBeforeLastUser(base: ChatMessage[], insert: ChatMessage | null): 
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    const t = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
     p.then(
       (v) => {
         clearTimeout(t);
@@ -109,15 +118,84 @@ async function runWithConcurrency<T>(
     }
   }
 
-  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+  const workers = Array.from(
+    { length: Math.max(1, concurrency) },
+    () => worker()
+  );
   await Promise.all(workers);
   return results;
 }
 
 // -----------------------------
+// Thread auto-title helpers
+// -----------------------------
+function cleanTitle(s: string) {
+  const t = (s ?? "")
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\s+/g, " ");
+  return t.length > 80 ? t.slice(0, 80).trim() : t;
+}
+
+function isEmptyTitle(v: any) {
+  const t = String(v ?? "").trim();
+  return !t || t.toLowerCase() === "new chat";
+}
+
+async function inferThreadTitle(args: {
+  lastUser: string;
+  recentMessages: ChatMessage[];
+}) {
+  const { lastUser, recentMessages } = args;
+
+  const transcript = recentMessages
+    .slice(-8)
+    .map(
+      (m) => `${m.role.toUpperCase()}: ${toText(m.content).slice(0, 240)}`
+    )
+    .join("\n");
+
+  const system = [
+    `You extract a short, human-friendly thread title.`,
+    `Return ONLY the organization/hospital name being discussed.`,
+    `If no specific org/hospital is clearly stated, return EXACTLY: UNKNOWN`,
+    `Rules:`,
+    `- No punctuation other than hyphens and apostrophes`,
+    `- Max 8 words`,
+    `- No extra text`,
+  ].join("\n");
+
+  const user = [
+    `Last user message: ${lastUser || "(none)"}`,
+    ``,
+    `Recent transcript:`,
+    transcript || "(empty)",
+    ``,
+    `Output:`,
+  ].join("\n");
+
+  const r = await callClaude({
+    system,
+    messages: [{ role: "user", content: user }],
+    maxTokens: 50,
+  });
+
+  if (!r.ok) return "";
+
+  const raw = cleanTitle(toText(r.text ?? ""));
+  if (!raw) return "";
+  if (raw.toUpperCase() === "UNKNOWN") return "";
+
+  return raw;
+}
+
+// -----------------------------
 // Perplexity prompt construction
 // -----------------------------
-function buildPerplexityMessages(args: { target: string; extraQueries?: string[] }): ChatMessage[] {
+function buildPerplexityMessages(args: {
+  target: string;
+  extraQueries?: string[];
+}): ChatMessage[] {
   const system = [
     `ROLE + OBJECTIVE (STRICT)`,
     `You are a hospital intelligence researcher.`,
@@ -203,7 +281,9 @@ Complete URL list
 
   const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 5);
   const extraBlock = extra.length
-    ? `\n\nADDITIONAL SEARCH QUERIES (use to guide your search):\n- ${extra.join("\n- ")}`
+    ? `\n\nADDITIONAL SEARCH QUERIES (use to guide your search):\n- ${extra.join(
+        "\n- "
+      )}`
     : "";
 
   return [
@@ -213,7 +293,7 @@ Complete URL list
 }
 
 // -----------------------------
-// Contact-finding research (Perplexity)
+// Contact-finding research (Perplexity) - unused here but kept
 // -----------------------------
 function isContactLookupIntent(text: string) {
   const t = (text ?? "").toLowerCase();
@@ -262,7 +342,10 @@ function buildPerplexityContactMessages(args: { org: string }): ChatMessage[] {
   ];
 }
 
-function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown; url?: unknown }[] }) {
+function formatResearchBlock(p: {
+  answer?: string;
+  citations?: { title?: unknown; url?: unknown }[];
+}) {
   const lines: string[] = [];
   lines.push("[External Research — Perplexity]");
   if (p.answer) lines.push(String(p.answer).trim());
@@ -288,7 +371,11 @@ function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown
 // -----------------------------
 // Research cache
 // -----------------------------
-function makeCacheKey(input: { route: string; queries: string[]; lastUser: string }) {
+function makeCacheKey(input: {
+  route: string;
+  queries: string[];
+  lastUser: string;
+}) {
   const q = (input.queries ?? []).slice(0, 3).join("|");
   const u = (input.lastUser ?? "").slice(0, 200);
   return `route=${input.route}::q=${q}::u=${u}`;
@@ -322,7 +409,10 @@ async function putCachedResearch(
       const rawTitle = c?.title;
       const rawUrl = c?.url;
 
-      const title = typeof rawTitle === "string" ? rawTitle.trim() : String(rawTitle ?? "").trim();
+      const title =
+        typeof rawTitle === "string"
+          ? rawTitle.trim()
+          : String(rawTitle ?? "").trim();
 
       const url =
         typeof rawUrl === "string"
@@ -356,7 +446,9 @@ function normalizeFindingList(v: any, limit = 8): string[] {
     .slice(0, limit);
 }
 
-function buildCouncilFindings(items: Array<{ agent: string; telemetry: any | null }>): string {
+function buildCouncilFindings(
+  items: Array<{ agent: string; telemetry: any | null }>
+): string {
   const alerts: string[] = [];
   const recommendations: string[] = [];
   const assumptions: string[] = [];
@@ -424,7 +516,13 @@ function safeAgentList(x: any): string[] {
   return x.map((s) => String(s)).filter(Boolean);
 }
 
-const RUNNABLE = new Set(["icpFit", "salesStrategy", "stakeholderMap", "draftOutreach", "chat"]);
+const RUNNABLE = new Set([
+  "icpFit",
+  "salesStrategy",
+  "stakeholderMap",
+  "draftOutreach",
+  "chat",
+]);
 
 // -----------------------------
 // Specialist runner
@@ -439,22 +537,47 @@ async function runOneAgent(args: {
 
   if (agentId === "icpFit") {
     const r: any = await runIcpFit({ tenantId, messages, entityData });
-    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+    return {
+      agentId,
+      content_text: toText(r?.content_text ?? "").trim(),
+      telemetry: r?.qb_json ?? null,
+    };
   }
 
   if (agentId === "salesStrategy") {
     const r: any = await runSalesStrategy({ tenantId, messages, entityData });
-    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+    return {
+      agentId,
+      content_text: toText(r?.content_text ?? "").trim(),
+      telemetry: r?.qb_json ?? null,
+    };
   }
 
   if (agentId === "stakeholderMap") {
-    const r: any = await runStakeholderMapping({ tenantId, messages, entityData });
-    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+    const r: any = await runStakeholderMapping({
+      tenantId,
+      messages,
+      entityData,
+    });
+    return {
+      agentId,
+      content_text: toText(r?.content_text ?? "").trim(),
+      telemetry: r?.qb_json ?? null,
+    };
   }
 
   if (agentId === "draftOutreach") {
-    const r: any = await runDraftOutreach({ tenantId, messages, entityData, channel: "email" });
-    return { agentId, content_text: toText(r?.content_text ?? "").trim(), telemetry: r?.qb_json ?? null };
+    const r: any = await runDraftOutreach({
+      tenantId,
+      messages,
+      entityData,
+      channel: "email",
+    });
+    return {
+      agentId,
+      content_text: toText(r?.content_text ?? "").trim(),
+      telemetry: r?.qb_json ?? null,
+    };
   }
 
   return { agentId, content_text: "", telemetry: null };
@@ -471,10 +594,12 @@ export async function POST(req: Request) {
     const threadId = body?.threadId;
 
     if (!threadId || typeof threadId !== "string") {
-      return NextResponse.json({ ok: false, error: "threadId required" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "threadId required" },
+        { status: 400 }
+      );
     }
 
-    // RLS enforces ownership on the server client
     const { data: threadRow, error: tErr } = await supabase
       .from("chat_threads")
       .select("id, account_id, title")
@@ -482,8 +607,10 @@ export async function POST(req: Request) {
       .eq("id", threadId)
       .maybeSingle();
 
-    if (tErr) return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
-    if (!threadRow) return NextResponse.json({ ok: false, error: "not_found" }, { status: 404 });
+    if (tErr)
+      return NextResponse.json({ ok: false, error: tErr.message }, { status: 500 });
+    if (!threadRow)
+      return NextResponse.json({ ok: false, error: "not_found" }, { status: 404 });
 
     const { data: rows, error: mErr } = await supabase
       .from("chat_messages")
@@ -492,7 +619,8 @@ export async function POST(req: Request) {
       .eq("thread_id", threadId)
       .order("created_at", { ascending: true });
 
-    if (mErr) return NextResponse.json({ ok: false, error: mErr.message }, { status: 500 });
+    if (mErr)
+      return NextResponse.json({ ok: false, error: mErr.message }, { status: 500 });
 
     const messages: ChatMessage[] = normalizeMessages((rows ?? []) as Row[]);
     const lastUser = lastUserText(messages);
@@ -530,7 +658,11 @@ export async function POST(req: Request) {
       return {
         confidence: 0.2,
         reason: `QB failed: ${toText((err as any)?.message ?? err)}`,
-        routing: { decision_mode: "fallback", agents_to_call: ["chat"], priority_order: ["chat"] },
+        routing: {
+          decision_mode: "fallback",
+          agents_to_call: ["chat"],
+          priority_order: ["chat"],
+        },
         needsResearch: false,
         researchQueries: [],
       } as any;
@@ -542,78 +674,84 @@ export async function POST(req: Request) {
     );
 
     const agentsToRun = plannedAgents.filter((a) => RUNNABLE.has(a));
-    const route: "chat" | "icpFit" = agentsToRun.includes("icpFit") ? "icpFit" : "chat";
+    const route: "chat" | "icpFit" = agentsToRun.includes("icpFit")
+      ? "icpFit"
+      : "chat";
 
     // -----------------------------
-   // -----------------------------
-// Perplexity research (cached + timed)
-// QB is the ONLY boss of research: it decides needsResearch + provides queries.
-// -----------------------------
-let researchMsg: ChatMessage | null = null;
-let usedResearch = false;
+    // Perplexity research (cached + timed)
+    // -----------------------------
+    let researchMsg: ChatMessage | null = null;
+    let usedResearch = false;
 
-const researchQueries = Array.isArray((decision as any)?.researchQueries)
-  ? ((decision as any).researchQueries as any[]).map((q) => String(q ?? "").trim()).filter(Boolean)
-  : [];
+    const researchQueries = Array.isArray((decision as any)?.researchQueries)
+      ? ((decision as any).researchQueries as any[])
+          .map((q) => String(q ?? "").trim())
+          .filter(Boolean)
+      : [];
 
-const needsResearch = Boolean((decision as any)?.needsResearch);
+    const needsResearch = Boolean((decision as any)?.needsResearch);
+    const canRunResearch = needsResearch && researchQueries.length >= 3;
 
-// ✅ safety backstop: if QB says "research" but gives < 3 queries, don't run
-const canRunResearch = needsResearch && researchQueries.length >= 3;
+    if (canRunResearch) {
+      const cacheKey = makeCacheKey({
+        route,
+        queries: researchQueries,
+        lastUser,
+      });
 
-if (canRunResearch) {
-  const cacheKey = makeCacheKey({ route, queries: researchQueries, lastUser });
+      const cached = await withTimeout(
+        getCachedResearch(supabase, tenantId, cacheKey),
+        2_000,
+        "Research cache read"
+      ).catch(() => null);
 
-  const cached = await withTimeout(
-    getCachedResearch(supabase, tenantId, cacheKey),
-    2_000,
-    "Research cache read"
-  ).catch(() => null);
+      if (cached?.answer) {
+        usedResearch = true;
+        researchMsg = {
+          role: "assistant",
+          content: formatResearchBlock({
+            answer: cached.answer,
+            citations: (cached.citations ?? []) as any[],
+          }),
+        };
+      } else {
+        const subject = lastUser || "the target hospital";
 
-  if (cached?.answer) {
-    usedResearch = true;
-    researchMsg = {
-      role: "assistant",
-      content: formatResearchBlock({
-        answer: cached.answer,
-        citations: (cached.citations ?? []) as any[],
-      }),
-    };
-  } else {
-    const subject = lastUser || "the target hospital";
+        const pplx = await withTimeout(
+          callPerplexity({
+            messages: buildPerplexityMessages({
+              target: subject,
+              extraQueries: researchQueries,
+            }),
+            maxTokens: 2200,
+          }),
+          RESEARCH_TIMEOUT_MS,
+          "Perplexity research"
+        ).catch((err) => ({
+          ok: false,
+          answer: "",
+          citations: [],
+          error: toText((err as any)?.message ?? err),
+        }));
 
-    const pplx = await withTimeout(
-      callPerplexity({
-        messages: buildPerplexityMessages({
-          target: subject,
-          extraQueries: researchQueries,
-        }),
-        maxTokens: 2200,
-      }),
-      RESEARCH_TIMEOUT_MS,
-      "Perplexity research"
-    ).catch((err) => ({
-      ok: false,
-      answer: "",
-      citations: [],
-      error: toText((err as any)?.message ?? err),
-    }));
+        if (pplx?.ok) {
+          usedResearch = true;
+          researchMsg = {
+            role: "assistant",
+            content: formatResearchBlock({
+              answer: pplx.answer,
+              citations: pplx.citations,
+            }),
+          };
 
-    if (pplx?.ok) {
-      usedResearch = true;
-      researchMsg = {
-        role: "assistant",
-        content: formatResearchBlock({ answer: pplx.answer, citations: pplx.citations }),
-      };
-
-      void putCachedResearch(supabase, tenantId, cacheKey, {
-        answer: pplx.answer,
-        citations: pplx.citations ?? [],
-      }).catch(() => {});
+          void putCachedResearch(supabase, tenantId, cacheKey, {
+            answer: pplx.answer,
+            citations: pplx.citations ?? [],
+          }).catch(() => {});
+        }
+      }
     }
-  }
-}
-
 
     // -----------------------------
     // KB retrieval (never fatal + timed)
@@ -646,15 +784,14 @@ if (canRunResearch) {
     if (accountMsg) augmented = [...augmented, accountMsg];
     if (researchMsg) augmented = [...augmented, researchMsg];
 
-console.log("RESPOND_TRACE", {
-  threadId,
-  route,
-  plannedAgents,
-  agentsToRun,
-  needsResearch,
-  researchQueriesCount: researchQueries.length,
-});
-
+    console.log("RESPOND_TRACE", {
+      threadId,
+      route,
+      plannedAgents,
+      agentsToRun,
+      needsResearch,
+      researchQueriesCount: researchQueries.length,
+    });
 
     // -----------------------------
     // Run specialists
@@ -670,7 +807,10 @@ console.log("RESPOND_TRACE", {
       );
     });
 
-    const settled = await runWithConcurrency(specialistTasks, MAX_AGENT_CONCURRENCY);
+    const settled = await runWithConcurrency(
+      specialistTasks,
+      MAX_AGENT_CONCURRENCY
+    );
 
     const perspectives: string[] = [];
     const councilInputs: Array<{ agent: string; telemetry: any | null }> = [];
@@ -695,7 +835,9 @@ console.log("RESPOND_TRACE", {
         perspectives.push(
           `[Agent Perspective: ${label}]\n` +
             (r.content_text || "(empty)") +
-            (r.telemetry ? `\n\n[Telemetry]\n${JSON.stringify(r.telemetry, null, 2)}` : "")
+            (r.telemetry
+              ? `\n\n[Telemetry]\n${JSON.stringify(r.telemetry, null, 2)}`
+              : "")
         );
 
         councilInputs.push({ agent: r.agentId, telemetry: r.telemetry ?? null });
@@ -703,7 +845,9 @@ console.log("RESPOND_TRACE", {
         councilInputs.push({
           agent: agentId,
           telemetry: {
-            alerts: [`Agent failed: ${toText((s.reason as any)?.message ?? s.reason)}`],
+            alerts: [
+              `Agent failed: ${toText((s.reason as any)?.message ?? s.reason)}`,
+            ],
             recommendations: [],
             assumptions: [],
             questions: [],
@@ -714,20 +858,30 @@ console.log("RESPOND_TRACE", {
 
     const perspectiveMsg: ChatMessage | null =
       perspectives.length > 0
-        ? { role: "assistant", content: `[Agent Perspectives]\n\n${perspectives.join("\n\n---\n\n")}` }
+        ? {
+            role: "assistant",
+            content: `[Agent Perspectives]\n\n${perspectives.join(
+              "\n\n---\n\n"
+            )}`,
+          }
         : null;
 
     const councilMsg: ChatMessage | null =
-      councilInputs.length > 0 ? { role: "assistant", content: buildCouncilFindings(councilInputs) } : null;
+      councilInputs.length > 0
+        ? { role: "assistant", content: buildCouncilFindings(councilInputs) }
+        : null;
 
-    // Mark internal blocks clearly so the main agent doesn't echo them
     const routingMsg: ChatMessage = {
       role: "assistant",
       content:
         `[INTERNAL_ROUTING_DO_NOT_RENDER]\n` +
         `decision_mode: ${toText(routing?.decision_mode)}\n` +
-        `agents_to_call: ${(routing?.agents_to_call ?? []).map(toText).join(", ")}\n` +
-        `priority_order: ${(routing?.priority_order ?? []).map(toText).join(", ")}\n` +
+        `agents_to_call: ${(routing?.agents_to_call ?? [])
+          .map(toText)
+          .join(", ")}\n` +
+        `priority_order: ${(routing?.priority_order ?? [])
+          .map(toText)
+          .join(", ")}\n` +
         `confidence: ${toText((decision as any)?.confidence)}\n` +
         `reason: ${toText((decision as any)?.reason)}`,
     };
@@ -752,15 +906,20 @@ console.log("RESPOND_TRACE", {
     });
 
     if (!llm.ok) {
-      return NextResponse.json({ ok: false, error: llm.error ?? "Claude failed" }, { status: 502 });
+      return NextResponse.json(
+        { ok: false, error: llm.error ?? "Claude failed" },
+        { status: 502 }
+      );
     }
 
     const assistantText = toText(llm.text ?? "").trim();
     if (!assistantText) {
-      return NextResponse.json({ ok: false, error: "Empty model response" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Empty model response" },
+        { status: 500 }
+      );
     }
 
-    // Save assistant message (include user_id for consistency)
     const { error: insErr } = await supabase.from("chat_messages").insert({
       tenant_id: tenantId,
       thread_id: threadId,
@@ -770,7 +929,35 @@ console.log("RESPOND_TRACE", {
     });
 
     if (insErr) {
-      return NextResponse.json({ ok: false, error: insErr.message }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: insErr.message },
+        { status: 500 }
+      );
+    }
+
+    // -----------------------------
+    // Auto-title thread — best effort, never fatal
+    // -----------------------------
+    try {
+      if (isEmptyTitle(threadRow?.title)) {
+        const title = await withTimeout(
+          inferThreadTitle({ lastUser, recentMessages: messages }),
+          3_000,
+          "Thread auto-title"
+        ).catch(() => "");
+
+        const finalTitle = cleanTitle(title);
+
+        if (finalTitle) {
+          await supabase
+            .from("chat_threads")
+            .update({ title: finalTitle })
+            .eq("tenant_id", tenantId)
+            .eq("id", threadId);
+        }
+      }
+    } catch {
+      // swallow
     }
 
     return NextResponse.json({
@@ -784,10 +971,16 @@ console.log("RESPOND_TRACE", {
       specialist_results: settled.map((s, i) => ({
         agent: specialistIds[i],
         ok: s.status === "fulfilled",
-        error: s.status === "rejected" ? toText((s.reason as any)?.message ?? s.reason) : null,
+        error:
+          s.status === "rejected"
+            ? toText((s.reason as any)?.message ?? s.reason)
+            : null,
       })),
     });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message ?? "Unknown server error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? "Unknown server error" },
+      { status: 500 }
+    );
   }
 }
