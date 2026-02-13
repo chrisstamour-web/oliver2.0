@@ -22,12 +22,13 @@ export async function sendMessage(args: { threadId: string | null; content: stri
   if (!threadId) {
     const { data: created, error: cErr } = await supabase
       .from("chat_threads")
-      .insert({
-        tenant_id: tenantId,
-        owner_user_id: user.id, // ✅ REQUIRED for your chat_threads RLS
-        title: null,
-        account_id: null,
-      })
+.insert({
+  tenant_id: tenantId,
+  user_id: user.id,
+  title: null,
+  account_id: null,
+})
+
       .select("id")
       .single();
 

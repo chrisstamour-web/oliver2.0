@@ -9,7 +9,7 @@ export default async function Home({
 }: {
   searchParams: Promise<{ thread?: string }>;
 }) {
-  const { supabase, tenantId } = await getTenantIdOrThrow();
+  const { supabase, tenantId, user } = await getTenantIdOrThrow();
 
   const sp = await searchParams;
   const requestedThreadId = sp?.thread ?? null;
@@ -22,8 +22,10 @@ export default async function Home({
     const { data: tRow, error: tErr } = await supabase
       .from("chat_threads")
       .select("id")
-      .eq("id", threadId)
-      .eq("tenant_id", tenantId)
+.eq("id", threadId)
+.eq("tenant_id", tenantId)
+.eq("user_id", user.id)
+
       .maybeSingle();
 
     if (tErr) {
@@ -41,8 +43,10 @@ export default async function Home({
     const { data: messages, error } = await supabase
       .from("chat_messages")
       .select("id, role, content, created_at")
-      .eq("thread_id", threadId)
-      .eq("tenant_id", tenantId)
+.eq("thread_id", threadId)
+.eq("tenant_id", tenantId)
+.eq("user_id", user.id)
+
       .order("created_at", { ascending: true });
 
     if (error) {

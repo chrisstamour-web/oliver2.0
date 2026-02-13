@@ -14,14 +14,15 @@ function prettyDate(v?: string | null) {
 }
 
 export default async function HistoryPage() {
-  const { supabase, tenantId } = await getTenantIdOrThrow();
+  const { supabase, tenantId, user } = await getTenantIdOrThrow();
 
 const { data: threads, error } = await supabase
   .from("chat_threads")
   // ✅ Only threads with at least one message
   .select("id, title, updated_at, created_at, account_id, chat_messages!inner(id)")
-  .eq("tenant_id", tenantId)
-  .order("updated_at", { ascending: false })
+.eq("tenant_id", tenantId)
+.eq("user_id", user.id)
+.order("updated_at", { ascending: false })
   .limit(50);
 
   if (error) {
@@ -54,8 +55,10 @@ const { data: threads, error } = await supabase
     const { data: earlyMsgs } = await supabase
       .from("chat_messages")
       .select("thread_id, content, created_at, role")
-      .in("thread_id", threadIds)
-      .eq("role", "user")
+ .eq("tenant_id", tenantId)
+.eq("user_id", user.id)
+.in("thread_id", threadIds)
+.eq("role", "user")
       .order("created_at", { ascending: true })
       .limit(200);
 
