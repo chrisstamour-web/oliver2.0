@@ -1,7 +1,8 @@
+// app/(auth)/login/LoginClient.tsx
 "use client";
 
 import { useMemo, useState, useCallback } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { createSupabaseBrowserClient } from "@/lib/supabase/browser";
 
 const BRAND = "#49257a";
@@ -15,7 +16,7 @@ function GoogleIcon() {
       />
       <path
         fill="#FF3D00"
-        d="M6.3 14.7l6.6 4.8C14.7 15.3 19 12 24 12c3.1 0 5.9 A1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4c-7.7 0-14.4 4.3-17.7 10.7z"
+        d="M6.3 14.7l6.6 4.8C14.7 15.3 19 12 24 12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.2 6.2 29.3 4 24 4c-7.7 0-14.4 4.3-17.7 10.7z"
       />
       <path
         fill="#4CAF50"
@@ -42,7 +43,7 @@ function MicrosoftIcon() {
 
 /**
  * Prefer an env-based site URL in prod so OAuth never falls back to localhost.
- * Set NEXT_PUBLIC_SITE_URL in Vercel to: https://app.pathovagtm.com
+ * Set NEXT_PUBLIC_SITE_URL in Vercel to: https://app.pathovagtm.com  (or your real domain)
  */
 function getCallbackUrl() {
   if (typeof window === "undefined") return "/auth/callback";
@@ -53,13 +54,9 @@ function getCallbackUrl() {
   return `${origin.replace(/\/$/, "")}/auth/callback`;
 }
 
-export default function LoginClient() {
+export default function LoginClient({ next }: { next: string }) {
   const router = useRouter();
-  const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
-
-  // If you ever pass ?next=/somewhere, we preserve it through OAuth.
-  const next = searchParams.get("next") ?? "/";
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
