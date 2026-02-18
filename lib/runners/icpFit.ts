@@ -5,6 +5,8 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import type { ChatMessage } from "@/lib/llm/types";
 import { callClaude } from "@/lib/llm/claude";
 import { loadPromptMarkdown } from "@/lib/agents/promptLoader";
+import { extractQbJsonBlock } from "@/lib/agents/qb/extractQbJsonBlock";
+import { lastUserText } from "@/lib/runners/_core/lastUserText";
 
 export type IcpFitTelemetry = {
   type: "icp_fit";
@@ -24,10 +26,12 @@ export type RunIcpFitArgs = {
   companyContext?: string;
 };
 
-type KbRow = {
+type KbDocRow = {
   id: string;
   title: string | null;
-  content_md: string | null;
+  content: string | null;
+  document_type: "instructional" | "knowledge" | null;
+  status: "draft" | "approved" | "deprecated" | null;
   metadata: any;
   updated_at: string | null;
 };
@@ -36,10 +40,8 @@ type KbRow = {
 let _icpFitSystemPrompt: string | null = null;
 function getIcpFitSystemPrompt() {
   if (_icpFitSystemPrompt) return _icpFitSystemPrompt;
-
-  const text = loadPromptMarkdown("icpFit.md"); // loader returns a string
+  const text = loadPromptMarkdown("icpFit.md");
   _icpFitSystemPrompt = text;
-
   return _icpFitSystemPrompt;
 }
 
@@ -61,50 +63,41 @@ function escapeForIlike(q: string) {
     .trim();
 }
 
-async function kbSearch(tenantId: string, query: string, limit = 8) {
+async function kbSearchDocuments(
+  tenantId: string,
+  query: string,
+  limit = 8,
+  opts?: {
+    docType?: "knowledge" | "instructional" | "any";
+    sourceType?: "notion" | "any";
+  }
+) {
   const admin = getAdminClient();
   const q = escapeForIlike(query);
+  const docType = opts?.docType ?? "any";
+  const sourceType = opts?.sourceType ?? "notion"; // keep strict by default
 
-  const { data, error } = await admin
-    .from("kb_items")
-    .select("id,title,content_md,metadata,updated_at")
+  let builder = admin
+    .from("kb_documents")
+    .select("id,title,content,document_type,status,metadata,updated_at")
     .eq("tenant_id", tenantId)
-    .or(`title.ilike.%${q}%,content_md.ilike.%${q}%`)
+    .eq("status", "approved")
+    .or(`title.ilike.%${q}%,content.ilike.%${q}%`)
     .order("updated_at", { ascending: false })
     .limit(limit);
 
+  if (sourceType !== "any") {
+    builder = builder.eq("source_type", sourceType);
+  }
+
+  if (docType !== "any") {
+    builder = builder.eq("document_type", docType);
+  }
+
+  const { data, error } = await builder;
+
   if (error) throw new Error(`KB search failed: ${error.message}`);
-  return (data ?? []) as KbRow[];
-}
-
-function lastUserText(messages: ChatMessage[]) {
-  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
-  }
-  return "";
-}
-
-/**
- * Optional telemetry:
- * <!--QB_JSON {...} -->
- */
-function extractQbJsonBlock(text: string): { cleanedText: string; qbJson?: IcpFitTelemetry } {
-  const raw = String(text ?? "");
-  const re = /<!--\s*QB_JSON\s*([\s\S]*?)-->/i;
-  const m = raw.match(re);
-  if (!m) return { cleanedText: raw.trim() };
-
-  const inner = (m[1] ?? "").trim();
-
-  let parsed: any = undefined;
-  try {
-    parsed = JSON.parse(inner);
-  } catch {
-    parsed = undefined;
-  }
-
-  const cleanedText = raw.replace(re, "").trim();
-  return { cleanedText, qbJson: parsed };
+  return (data ?? []) as KbDocRow[];
 }
 
 export async function runIcpFit(args: RunIcpFitArgs) {
@@ -115,16 +108,18 @@ export async function runIcpFit(args: RunIcpFitArgs) {
 
   // Pull KB context for ICP fit
   const [icpFramework, disqualifiers, examples] = await Promise.all([
-    kbSearch(args.tenantId, "ICP framework"),
-    kbSearch(args.tenantId, "disqualifier"),
-    kbSearch(args.tenantId, "example"),
+    kbSearchDocuments(args.tenantId, "ICP framework", 8, { docType: "knowledge" }),
+    kbSearchDocuments(args.tenantId, "disqualifier", 8, { docType: "knowledge" }),
+    kbSearchDocuments(args.tenantId, "example", 8, { docType: "knowledge" }),
   ]);
 
   const kbBundle = [
-    ...icpFramework.map((x) => `## ${x.title ?? "Untitled"}\n${x.content_md ?? ""}`),
-    ...disqualifiers.map((x) => `## ${x.title ?? "Untitled"}\n${x.content_md ?? ""}`),
-    ...examples.map((x) => `## ${x.title ?? "Untitled"}\n${x.content_md ?? ""}`),
-  ].join("\n\n");
+    ...icpFramework.map((x) => `## ${x.title ?? "Untitled"}\n${x.content ?? ""}`),
+    ...disqualifiers.map((x) => `## ${x.title ?? "Untitled"}\n${x.content ?? ""}`),
+    ...examples.map((x) => `## ${x.title ?? "Untitled"}\n${x.content ?? ""}`),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const system = `${systemPrompt}
 
@@ -181,7 +176,7 @@ Rules:
   const raw = String(llm.text ?? "").trim();
   if (!raw) throw new Error("icpFit returned empty response");
 
-  const { cleanedText, qbJson } = extractQbJsonBlock(raw);
+  const { cleanedText, qbJson } = extractQbJsonBlock<IcpFitTelemetry>(raw);
 
   return {
     ok: true,

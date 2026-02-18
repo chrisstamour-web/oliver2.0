@@ -4,8 +4,9 @@ import "server-only";
 import type { ChatMessage } from "@/lib/llm/types";
 import { callClaude } from "@/lib/llm/claude";
 import { loadPromptMarkdown } from "@/lib/agents/promptLoader";
-import { searchKb } from "@/lib/kb/searchKb";
-import { formatKbBlock } from "@/lib/kb/formatKb";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+import { extractQbJsonBlock } from "@/lib/agents/qb/extractQbJsonBlock";
+import { lastUserText } from "@/lib/runners/_core/lastUserText";
 
 export interface StakeholderMappingContext {
   product_type?: string;
@@ -38,41 +39,74 @@ export type RunStakeholderMappingArgs = {
   accountContext?: string;
 };
 
-let _systemPrompt: string | null = null;
-function getSystemPrompt() {
-  if (_systemPrompt) return _systemPrompt;
-  _systemPrompt = loadPromptMarkdown("stakeholderMapping.md");
-  return _systemPrompt;
+type KbDocRow = {
+  id: string;
+  title: string | null;
+  content: string | null;
+  document_type: "instructional" | "knowledge" | null;
+  status: "draft" | "approved" | "deprecated" | null;
+  metadata: any;
+  updated_at: string | null;
+};
+
+// ---- prompt cache (per serverless instance) ----
+let _stakeholderMappingSystemPrompt: string | null = null;
+function getStakeholderMappingSystemPrompt() {
+  if (_stakeholderMappingSystemPrompt) return _stakeholderMappingSystemPrompt;
+  _stakeholderMappingSystemPrompt = loadPromptMarkdown("stakeholderMapping.md");
+  return _stakeholderMappingSystemPrompt;
 }
 
-function lastUserText(messages: ChatMessage[]) {
-  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
-  }
-  return "";
+// Works whether supabaseAdmin is a function or a client object
+function getAdminClient() {
+  return typeof supabaseAdmin === "function" ? supabaseAdmin() : supabaseAdmin;
+}
+
+function escapeForIlike(q: string) {
+  return String(q ?? "")
+    .replaceAll("%", "\\%")
+    .replaceAll("_", "\\_")
+    .replaceAll(",", " ")
+    .replaceAll("(", " ")
+    .replaceAll(")", " ")
+    .replaceAll('"', " ")
+    .replaceAll("'", " ")
+    .trim();
 }
 
 /**
- * Optional telemetry:
- * <!--QB_JSON {...} -->
+ * Cheap KB retrieval (no embeddings):
+ * - title/content ilike
+ * - approved only
+ * - cap rows
  */
-function extractQbJsonBlock<T = any>(text: string): { cleanedText: string; qbJson?: T } {
-  const raw = String(text ?? "");
-  const re = /<!--\s*QB_JSON\s*([\s\S]*?)-->/i;
-  const m = raw.match(re);
-  if (!m) return { cleanedText: raw.trim() };
+async function kbSearchDocuments(
+  tenantId: string,
+  query: string,
+  limit = 6,
+  opts?: { docType?: "knowledge" | "instructional" | "any"; sourceType?: "notion" | "any" }
+) {
+  const admin = getAdminClient();
+  const q = escapeForIlike(query);
+  const docType = opts?.docType ?? "any";
+  const sourceType = opts?.sourceType ?? "notion";
 
-  const inner = (m[1] ?? "").trim();
-  let parsed: any = undefined;
+  let builder = admin
+    .from("kb_documents")
+    .select("id,title,content,document_type,status,metadata,updated_at")
+    .eq("tenant_id", tenantId)
+    .eq("status", "approved")
+    .or(`title.ilike.%${q}%,content.ilike.%${q}%`)
+    .order("updated_at", { ascending: false })
+    .limit(limit);
 
-  try {
-    parsed = JSON.parse(inner);
-  } catch {
-    parsed = undefined;
-  }
+  if (sourceType !== "any") builder = builder.eq("source_type", sourceType);
+  if (docType !== "any") builder = builder.eq("document_type", docType);
 
-  const cleanedText = raw.replace(re, "").trim();
-  return { cleanedText, qbJson: parsed };
+  const { data, error } = await builder;
+  if (error) throw new Error(`KB search failed: ${error.message}`);
+
+  return (data ?? []) as KbDocRow[];
 }
 
 function buildContextSummary(ctx?: StakeholderMappingContext): string {
@@ -94,54 +128,61 @@ function buildContextSummary(ctx?: StakeholderMappingContext): string {
 
 /**
  * Keep KB calls cheap:
- * - one composite query
- * - cap results inside searchKb()
+ * - one composite query string
+ * - de-dupe tokens
  */
 function buildKbQuery(ctx?: StakeholderMappingContext): string {
   const c = ctx ?? {};
   const tokens: string[] = [
-    "stakeholder role profiles decision authority response patterns",
-    "hospital medtech buying committee",
-    "budget approval path CFO CEO procurement",
+    "stakeholder mapping roles decision makers",
+    "hospital buying committee procurement IT security",
+    "budget approval path CFO CEO",
   ];
 
   if (c.product_type) tokens.push(`${c.product_type} stakeholders`);
-  if (c.therapy_area) tokens.push(`${c.therapy_area} department stakeholders`);
+  if (c.therapy_area) tokens.push(`${c.therapy_area} stakeholders`);
   if (c.institution_type) tokens.push(`${c.institution_type} approval authority`);
   if (c.budget_size) tokens.push(`deal size ${c.budget_size} approvals`);
-  if (c.company_maturity === "unknown_startup") tokens.push("startup credibility FDA pilot evidence");
+  if (c.company_maturity === "unknown_startup") tokens.push("startup credibility pilot evidence");
   if (c.integration_requirements?.length) tokens.push(`integration ${c.integration_requirements.join(" ")}`);
 
-  // de-dupe + keep it from getting absurdly long
   const uniq = Array.from(new Set(tokens.map((t) => t.trim()).filter(Boolean)));
   return uniq.join(" | ").slice(0, 600);
 }
 
+function formatKbContext(rows: KbDocRow[]) {
+  if (!rows?.length) return "(No relevant KB documents found.)";
+  return rows
+    .map((r) => `## ${r.title ?? "Untitled"}\n${(r.content ?? "").slice(0, 2500)}`)
+    .join("\n\n");
+}
+
 export async function runStakeholderMapping(args: RunStakeholderMappingArgs) {
-  const systemPrompt = getSystemPrompt();
+  const systemPrompt = getStakeholderMappingSystemPrompt();
 
   const userInput = (args.accountContext ?? lastUserText(args.messages)).trim();
   if (!userInput) throw new Error("stakeholderMapping: empty user input");
 
-  const ctxSummary = buildContextSummary(args.context);
-  const kbQuery = buildKbQuery(args.context);
+  // Use provided context, otherwise derive from entityData
+  const ctx = args.context ?? extractStakeholderContext(args.entityData);
 
-  const kbHits = await searchKb({
-    tenantId: args.tenantId,
-    query: kbQuery,
-    limit: 6,
-  }).catch(() => []);
+  const ctxSummary = buildContextSummary(ctx);
+  const kbQuery = buildKbQuery(ctx);
 
-  const kbBlock = formatKbBlock(kbHits);
+  // For stakeholder mapping, "knowledge" docs are usually best.
+  const kbDocs = await kbSearchDocuments(args.tenantId, kbQuery, 6, { docType: "knowledge" }).catch(() => []);
+
   const augmentedSystem = `${systemPrompt}
 
-${kbBlock ? kbBlock : "[Knowledge Base]\n(no relevant KB hits)"}
+[Knowledge Base]
+${formatKbContext(kbDocs)}
 
 [User Context]
 ${ctxSummary}
 `.trim();
 
   const user = `Given the user’s request, produce a stakeholder mapping.
+
 If you output telemetry, append:
 
 <!--QB_JSON
@@ -176,7 +217,7 @@ If you output telemetry, append:
 }
 
 /**
- * Helper: Context Extractor (for QB)
+ * Helper: Context Extractor (for QB + runners)
  */
 export function extractStakeholderContext(entityData: any): StakeholderMappingContext {
   const e = entityData ?? {};

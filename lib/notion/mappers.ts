@@ -61,64 +61,99 @@ function normalizePhase(v: string | null): "1" | "1_2" | "all" {
   return "all";
 }
 
-/* ------------------ mapper ------------------ */
+/**
+ * Normalize status from Notion select.
+ * Canonical storage values:
+ *  - "draft"
+ *  - "approved"
+ *  - "deprecated"
+ */
+function normalizeStatus(v: string | null): "draft" | "approved" | "deprecated" {
+  const s = (v ?? "").trim().toLowerCase();
+  if (s === "approved") return "approved";
+  if (s === "deprecated") return "deprecated";
+  return "draft";
+}
 
-export async function mapNotionKbPageToRow(page: any) {
+/* ------------------ RAG Mapper (kb_documents) ------------------ */
+
+export type KbDocumentRow = {
+  tenant_id: string;
+  source_type: "notion";
+  source_id: string;
+  title: string;
+  content: string;
+  document_type: "instructional" | "knowledge";
+  status: "draft" | "approved" | "deprecated";
+  metadata: Record<string, any>;
+};
+
+/**
+ * Maps a Notion KB page -> kb_documents row (Phase 1 ingestion)
+ *
+ * IMPORTANT: Return shape must match kb_documents columns:
+ * tenant_id, source_type, source_id, title, content, document_type, status, metadata
+ */
+export async function mapNotionKbPageToRow(page: any): Promise<KbDocumentRow> {
   const source_id = page?.id;
-  if (!source_id) {
-    throw new Error("Notion page missing id");
-  }
+  if (!source_id) throw new Error("Notion page missing id");
 
   /* -------- Tenant ID (REQUIRED) -------- */
   const tenantRaw = plainText(getProp(page, "Tenant ID")?.rich_text);
   if (!tenantRaw || !isUuid(tenantRaw)) {
-    throw new Error(`KB item ${source_id} missing or invalid Tenant ID`);
+    throw new Error(`KB page ${source_id} missing or invalid Tenant ID`);
   }
 
-  /* -------- Phase (default = all) -------- */
+  /* -------- Phase -------- */
   const phaseRaw = selectName(getProp(page, "Phase"));
   const phase = normalizePhase(phaseRaw);
 
   /* -------- Type (REQUIRED) -------- */
-  const kb_type = selectName(getProp(page, "Type"));
-  if (!kb_type) {
-    throw new Error(`KB item ${source_id} missing required Type`);
-  }
+  const kbType = selectName(getProp(page, "Type"));
+  if (!kbType) throw new Error(`KB page ${source_id} missing required Type`);
 
-  /* -------- Status (default = draft) -------- */
+  /* -------- Status -------- */
   const statusRaw = selectName(getProp(page, "Status"));
-  const status =
-    statusRaw === "approved" || statusRaw === "deprecated"
-      ? statusRaw
-      : "draft";
+  const status = normalizeStatus(statusRaw);
 
-  /* -------- Core content -------- */
-  const title = plainText(getProp(page, "Title")?.title) || "Untitled";
+  /* -------- Title / Summary / Content -------- */
+  const title =
+    plainText(getProp(page, "Title")?.title) ||
+    plainText(getProp(page, "Name")?.title) ||
+    "Untitled";
 
   const summary = plainText(getProp(page, "Summary")?.rich_text) || null;
 
-  const content_md = await notionPageToMarkdown(source_id);
-  if (!content_md) {
-    throw new Error(`KB item ${source_id} has empty content`);
-  }
+  const content = await notionPageToMarkdown(source_id);
+  if (!content) throw new Error(`KB page ${source_id} has empty content`);
 
   /* -------- Tags -------- */
   const tags = multiSelectNames(getProp(page, "Tags"));
 
-  return {
-    // IMPORTANT: do NOT include `id`
-    tenant_id: tenantRaw,
+  /* -------- Determine document_type -------- */
+  // You can refine this later (e.g., based on a Notion property)
+  const document_type: "instructional" | "knowledge" =
+    kbType.toLowerCase().includes("instruction") ? "instructional" : "knowledge";
+
+  /* -------- Metadata (Preserve Everything Useful) -------- */
+  const metadata = {
     phase,
-    kb_type,
-    status,
-
-    title,
+    kb_type: kbType,
     summary,
-    content_md,
     tags,
-
-    source: "notion",
-    source_id,
     notion_last_edited_time: page?.last_edited_time ?? null,
+    // Keeping status in metadata is optional, but harmless and can help debugging
+    status,
+  };
+
+  return {
+    tenant_id: tenantRaw,
+    source_type: "notion",
+    source_id,
+    title,
+    content, // ✅ matches kb_documents column name
+    document_type,
+    status,  // ✅ real column (approved/draft/deprecated)
+    metadata,
   };
 }

@@ -64,7 +64,7 @@ export function formatKbBlock(hits: KbHit[]) {
     const bodyRaw =
       (h as any).summary && typeof (h as any).summary === "string"
         ? (h as any).summary
-        : (h as any).content_md ?? "";
+        : (h as any).content ?? "";
 
     // Keep each hit small and consistent
     const body = truncate(String(bodyRaw), 900);

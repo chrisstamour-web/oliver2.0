@@ -4,6 +4,8 @@ import "server-only";
 import type { ChatMessage } from "@/lib/llm/types";
 import { callClaude } from "@/lib/llm/claude";
 import { loadPromptMarkdown } from "@/lib/agents/promptLoader";
+import { extractQbJsonBlock } from "@/lib/agents/qb/extractQbJsonBlock";
+import { lastUserText } from "@/lib/runners/_core/lastUserText";
 
 export type DraftOutreachTelemetry = {
   type: "draft_outreach";
@@ -27,40 +29,17 @@ function getDraftOutreachSystemPrompt() {
   return _draftOutreachSystemPrompt;
 }
 
-function lastUserText(messages: ChatMessage[]) {
-  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
-  }
-  return "";
-}
+function normalizeDraftOutreachTelemetry(
+  qbJson: any,
+  channel: string
+): DraftOutreachTelemetry | undefined {
+  if (!qbJson || typeof qbJson !== "object") return undefined;
+  if (qbJson.type !== "draft_outreach") return undefined;
 
-/**
- * Optional telemetry:
- * <!--QB_JSON {...} -->
- */
-function extractQbJsonBlock(text: string): { cleanedText: string; qbJson?: DraftOutreachTelemetry } {
-  const raw = String(text ?? "");
-  const re = /<!--\s*QB_JSON\s*([\s\S]*?)-->/i;
-  const m = raw.match(re);
-  if (!m) return { cleanedText: raw.trim() };
-
-  const inner = (m[1] ?? "").trim();
-
-  let parsed: any = undefined;
-  try {
-    parsed = JSON.parse(inner);
-  } catch {
-    parsed = undefined;
-  }
-
-  const cleanedText = raw.replace(re, "").trim();
-
-  // validate shape lightly
-  if (!parsed || typeof parsed !== "object" || parsed.type !== "draft_outreach") {
-    return { cleanedText };
-  }
-
-  return { cleanedText, qbJson: parsed as DraftOutreachTelemetry };
+  // If channel is present, accept; otherwise set it
+  const out: DraftOutreachTelemetry = { ...(qbJson as any) };
+  if (!out.channel) out.channel = channel as any;
+  return out;
 }
 
 export async function runDraftOutreach(args: RunDraftOutreachArgs) {
@@ -106,13 +85,14 @@ If you produce telemetry, append:
   const raw = String(llm.text ?? "").trim();
   if (!raw) throw new Error("draftOutreach returned empty response");
 
-  const { cleanedText, qbJson } = extractQbJsonBlock(raw);
+  const { cleanedText, qbJson } = extractQbJsonBlock<any>(raw);
+  const telemetry = normalizeDraftOutreachTelemetry(qbJson, channel);
 
   return {
     ok: true,
     type: "draft_outreach" as const,
     title: "Draft Outreach",
     content_text: cleanedText,
-    qb_json: qbJson,
+    qb_json: telemetry,
   };
 }

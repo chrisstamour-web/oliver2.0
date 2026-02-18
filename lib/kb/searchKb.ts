@@ -5,7 +5,7 @@ export type KbHit = {
   id: string;
   title: string | null;
   summary: string | null;
-  content_md: string | null;
+  content: string | null;
   updated_at: string | null;
   metadata: any;
   rank?: number | null;

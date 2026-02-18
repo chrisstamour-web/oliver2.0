@@ -1,11 +1,12 @@
-// lib/agents/qb/qbRouter.ts
+// src/lib/agents/qb/qbRouter.ts
 import "server-only";
 
 import type { ChatMessage } from "@/lib/llm/types";
 import { callClaude } from "@/lib/llm/claude";
 import { decideResearchWithClaude } from "@/lib/agents/qb/researchRouter";
-import { shouldRunIcpFit } from "@/lib/agents/router";
+import { routeRunners } from "@/lib/agents/router";
 import { loadRouterAgent } from "@/lib/runners/routerAgent";
+import { RUNNERS } from "@/lib/runners/registry";
 
 export type DecisionMode = "rules" | "judgment" | "council" | "escalation";
 
@@ -26,6 +27,12 @@ export type QbDecision = {
   researchQueries: string[];
 };
 
+// Registry-backed allowlist (single source of truth)
+const KNOWN_AGENT_IDS = new Set<string>(["chat", ...Object.keys(RUNNERS)]);
+
+// -----------------------------
+// Helpers
+// -----------------------------
 function lastUserText(messages: ChatMessage[]) {
   for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
     if (messages[i]?.role === "user") return String(messages[i]?.content ?? "");
@@ -44,6 +51,82 @@ function clamp01(n: any): number {
   const x = typeof n === "number" ? n : Number(n);
   if (!Number.isFinite(x)) return 0;
   return Math.max(0, Math.min(1, x));
+}
+
+function dedupeKeepOrder(arr: unknown[], max = 8): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const x of arr) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+// Back-compat + router-agent snake_case support
+function normalizeAgentId(id: unknown): string {
+  const s = String(id ?? "").trim();
+  if (!s) return "";
+
+  // legacy
+  if (s === "stakeholderMap") return "stakeholderMapping";
+
+  // routerAgent.md allowed ids (snake_case)
+  if (s === "icp_fit") return "icpFit";
+  if (s === "sales_strategy") return "salesStrategy";
+  if (s === "stakeholder_map") return "stakeholderMapping";
+  if (s === "draft_outreach") return "draftOutreach";
+
+  // these may exist later, but not in registry today -> will be filtered out
+  if (s === "recommended_assets") return "recommendedAssets";
+  if (s === "risk_assessment") return "riskAssessment";
+
+  return s;
+}
+
+function normalizeDecisionMode(x: any): DecisionMode {
+  if (x === "rules" || x === "judgment" || x === "council" || x === "escalation") return x;
+  return "judgment";
+}
+
+function normalizeRouting(x: any): RoutingDecision {
+  const agentsRaw = Array.isArray(x?.agents_to_call) ? x.agents_to_call : [];
+  const prioRaw = Array.isArray(x?.priority_order) ? x.priority_order : agentsRaw;
+
+  const mode = normalizeDecisionMode(x?.decision_mode);
+
+  const agents = dedupeKeepOrder(agentsRaw.map(normalizeAgentId), 8).filter((id) =>
+    KNOWN_AGENT_IDS.has(id)
+  );
+
+  const prio = dedupeKeepOrder(prioRaw.map(normalizeAgentId), 8).filter((id) =>
+    KNOWN_AGENT_IDS.has(id)
+  );
+
+  if (!agents.length) {
+    return { agents_to_call: ["chat"], decision_mode: mode, priority_order: ["chat"] };
+  }
+
+  // ensure priority is a subset of agents (and non-empty)
+  const finalPrio = prio.length ? prio.filter((id) => agents.includes(id)) : agents;
+
+  return {
+    agents_to_call: agents,
+    decision_mode: mode,
+    priority_order: finalPrio.length ? finalPrio : agents,
+  };
+}
+
+function decisionModeFromCount(n: number): DecisionMode {
+  if (n <= 1) return "rules";
+  if (n === 2) return "judgment";
+  if (n === 3) return "council";
+  return "escalation";
 }
 
 function isInIcpContext(messages: ChatMessage[]) {
@@ -160,54 +243,23 @@ function followUpLooksIcpRelevant(input: string) {
   return cues.some((c) => s.includes(c));
 }
 
-function normalizeDecisionMode(x: any): DecisionMode {
-  if (x === "rules" || x === "judgment" || x === "council" || x === "escalation") return x;
-  return "judgment";
-}
-
-function normalizeRouting(x: any): RoutingDecision {
-  const agents = Array.isArray(x?.agents_to_call) ? x.agents_to_call.map(String) : [];
-  const prio = Array.isArray(x?.priority_order) ? x.priority_order.map(String) : agents;
-  const mode = normalizeDecisionMode(x?.decision_mode);
-
-  if (!agents.length) {
-    return { agents_to_call: ["chat"], decision_mode: mode, priority_order: ["chat"] };
-  }
-  return { agents_to_call: agents, decision_mode: mode, priority_order: prio.length ? prio : agents };
-}
-
 // -----------------------------
 // Research enforcement helpers
 // -----------------------------
 function uniqNonEmptyStrings(v: unknown, max = 8): string[] {
-  const arr = Array.isArray(v) ? v : [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-
-  for (const x of arr) {
-    const s = String(x ?? "").trim();
-    if (!s) continue;
-    const key = s.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-    if (out.length >= max) break;
-  }
-  return out;
+  return dedupeKeepOrder(Array.isArray(v) ? v : [], max);
 }
 
 function defaultResearchQueriesFromUserText(userText: string): string[] {
   const t = (userText ?? "").trim();
   if (!t) return [];
 
-  // Intentionally generic: works for "find names", "who to contact", "tech stack", etc.
-  // QB/researchRouter should still provide better ones; this is just a safety net.
   return [
     `${t} leadership team`,
-    `${t} director quality patient safety`,
+    `${t} quality patient safety director`,
     `${t} innovation office technology assessment`,
-    `${t} procurement contact email`,
-    `${t} site:muhc.ca directory email`, // harmless even if t isn't MUHC
+    `${t} procurement contact`,
+    `${t} directory email`,
   ];
 }
 
@@ -232,7 +284,6 @@ function enforceResearchRule(input: {
     return { needsResearch: true, researchQueries, researchReason };
   }
 
-  // Fill with fallback queries derived from the latest user message
   const fallback = defaultResearchQueriesFromUserText(lastUser);
   researchQueries = uniqNonEmptyStrings([...researchQueries, ...fallback], 8);
 
@@ -243,7 +294,6 @@ function enforceResearchRule(input: {
     return { needsResearch: true, researchQueries, researchReason };
   }
 
-  // If we still can't produce enough queries, flip off research
   return {
     needsResearch: false,
     researchQueries: [],
@@ -253,6 +303,9 @@ function enforceResearchRule(input: {
   };
 }
 
+// -----------------------------
+// Main QB decision
+// -----------------------------
 export async function decideRouteWithQb(args: {
   messages: ChatMessage[];
   decisionContext?: any;
@@ -267,14 +320,14 @@ export async function decideRouteWithQb(args: {
     priority_order: ["chat"],
   };
 
-  let confidence = 0;
-  let reason = "";
+  let confidence = 0.5;
+  let reason = "Default route";
 
   // --- HARD ROUTES ---
   if (isInIcpContext(messages) && looksLikeFollowUp(last) && followUpLooksIcpRelevant(last)) {
     routing = {
       agents_to_call: ["icpFit", "salesStrategy"],
-      decision_mode: "rules",
+      decision_mode: "judgment",
       priority_order: ["icpFit", "salesStrategy"],
     };
     confidence = 0.9;
@@ -282,81 +335,93 @@ export async function decideRouteWithQb(args: {
   } else if (looksLikeTargetAccountName(last)) {
     routing = {
       agents_to_call: ["icpFit", "salesStrategy"],
-      decision_mode: "rules",
+      decision_mode: "judgment",
       priority_order: ["icpFit", "salesStrategy"],
     };
     confidence = 0.9;
     reason = "Heuristic: latest message looks like a target account name.";
-  } else if (shouldRunIcpFit(messages)) {
-    routing = {
-      agents_to_call: ["icpFit", "salesStrategy"],
-      decision_mode: "judgment",
-      priority_order: ["icpFit", "salesStrategy"],
-    };
-    confidence = 0.82;
-    reason = "Keyword heuristic: user appears to be requesting ICP fit scoring.";
   } else {
-    // --- Router Agent (LLM) ---
-    const routerAgent = loadRouterAgent();
+    // --- HEURISTIC ROUTER (your TS router) ---
+    const plan = routeRunners(messages);
+    const calls = (plan?.calls ?? []).map(normalizeAgentId).filter((id) => KNOWN_AGENT_IDS.has(id));
 
-    const recent = (messages ?? []).slice(-10);
-    const convo = recent.map((m) => `${m.role}: ${m.content}`).join("\n");
+    if (calls.length) {
+      // Decide mode based on how many specialists we plan to call
+      const mode = decisionModeFromCount(calls.length);
 
-    const user = [
-      `Conversation (recent):\n${convo}`,
-      ``,
-      `Latest user message:\n${last}`,
-      ``,
-      `Decision Context:\n${JSON.stringify(decisionContext ?? {}, null, 2)}`,
-      ``,
-      `Entity Data:\n${JSON.stringify(entityData ?? {}, null, 2)}`,
-      ``,
-      `Return ONLY JSON matching the schema in the system prompt.`,
-    ].join("\n");
+      routing = {
+        agents_to_call: calls,
+        decision_mode: mode,
+        priority_order: calls,
+      };
 
-    const llm = await callClaude({
-      system: routerAgent.systemPrompt,
-      messages: [{ role: "user", content: user }],
-      json: true,
-      maxTokens: 300,
-    });
-
-    if (!llm.ok) {
-      routing = { agents_to_call: ["chat"], decision_mode: "judgment", priority_order: ["chat"] };
-      confidence = 0;
-      reason = llm.error ?? "RouterAgent routing failed";
+      confidence = calls.length >= 2 ? 0.8 : 0.72;
+      reason = `routeRunners: ${plan.reason || "matched_intent"} (${calls.join(", ")})`;
     } else {
-      const raw = (llm.text ?? "").trim();
-      const jsonStr = extractFirstJsonObject(raw) ?? raw;
+      // --- Router Agent (LLM) ---
+      const routerAgent = loadRouterAgent();
 
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(jsonStr);
-      } catch {
-        parsed = null;
-      }
+      const recent = (messages ?? []).slice(-10);
+      const convo = recent.map((m) => `${m.role}: ${m.content}`).join("\n");
 
-      routing = normalizeRouting(parsed);
+      const user = [
+        `Conversation (recent):\n${convo}`,
+        ``,
+        `Latest user message:\n${last}`,
+        ``,
+        `Decision Context:\n${JSON.stringify(decisionContext ?? {}, null, 2)}`,
+        ``,
+        `Entity Data:\n${JSON.stringify(entityData ?? {}, null, 2)}`,
+        ``,
+        `Return ONLY JSON matching the schema in the system prompt.`,
+      ].join("\n");
 
-      const inferred = parsed?.confidence;
-      confidence = inferred === undefined ? 0.65 : clamp01(inferred);
-      reason = String(parsed?.reason ?? "RouterAgent decision");
+      const llm = await callClaude({
+        system: routerAgent.systemPrompt,
+        messages: [{ role: "user", content: user }],
+        json: true,
+        maxTokens: 300,
+      });
 
-      const choseIcp = routing.agents_to_call.includes("icpFit");
-      if (choseIcp && confidence < 0.7) {
+      if (!llm.ok) {
         routing = { agents_to_call: ["chat"], decision_mode: "judgment", priority_order: ["chat"] };
-        reason = reason ? `${reason} (downgraded: confidence < 0.70)` : "Downgraded: confidence < 0.70";
+        confidence = 0.3;
+        reason = llm.error ?? "RouterAgent routing failed";
+      } else {
+        const raw = String(llm.text ?? "").trim();
+        const jsonStr = extractFirstJsonObject(raw) ?? raw;
+
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(jsonStr);
+        } catch {
+          parsed = null;
+        }
+
+        routing = normalizeRouting(parsed);
+        confidence = 0.62;
+        reason = `RouterAgent decision (mode=${routing.decision_mode}, agents=${routing.agents_to_call.join(", ")})`;
+
+        // Safety: if router picked nothing meaningful, fall back to chat
+        if (!routing.agents_to_call?.length) {
+          routing = { agents_to_call: ["chat"], decision_mode: "judgment", priority_order: ["chat"] };
+          confidence = 0.3;
+          reason = "RouterAgent returned no runnable agents; fallback to chat.";
+        }
       }
     }
   }
 
-  // --- Research decision (QB is boss) ---
+  // Final safety: ensure routing is registry-valid
+  routing = normalizeRouting(routing);
+
+  // --- Research decision (separate QB subsystem) ---
   const r = await decideResearchWithClaude({ messages });
 
   if (!r.ok) {
     return {
       routing,
-      confidence,
+      confidence: clamp01(confidence),
       reason,
       needsResearch: false,
       researchReason: `researchRouter failed: ${r.error}`,
@@ -364,7 +429,6 @@ export async function decideRouteWithQb(args: {
     };
   }
 
-  // ✅ ENFORCE: needsResearch => >= 3 queries
   const enforced = enforceResearchRule({
     lastUser: last,
     needsResearch: Boolean(r.decision.needs_research),
@@ -374,7 +438,7 @@ export async function decideRouteWithQb(args: {
 
   return {
     routing,
-    confidence,
+    confidence: clamp01(confidence),
     reason,
     needsResearch: enforced.needsResearch,
     researchReason: enforced.researchReason,

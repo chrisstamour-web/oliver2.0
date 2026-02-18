@@ -4,6 +4,8 @@ import "server-only";
 import type { ChatMessage } from "@/lib/llm/types";
 import { callClaude } from "@/lib/llm/claude";
 import { loadPromptMarkdown } from "@/lib/agents/promptLoader";
+import { extractQbJsonBlock } from "@/lib/agents/qb/extractQbJsonBlock";
+import { lastUserText } from "@/lib/runners/_core/lastUserText";
 
 export type SalesStrategyTelemetry = {
   type: "sales_strategy";
@@ -26,36 +28,6 @@ function getSalesStrategySystemPrompt() {
   const text = loadPromptMarkdown("salesStrategy.md");
   _salesStrategySystemPrompt = text;
   return _salesStrategySystemPrompt;
-}
-
-function lastUserText(messages: ChatMessage[]) {
-  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i]?.content ?? "";
-  }
-  return "";
-}
-
-/**
- * Optional telemetry:
- * <!--QB_JSON {...} -->
- */
-function extractQbJsonBlock(text: string): { cleanedText: string; qbJson?: SalesStrategyTelemetry } {
-  const raw = String(text ?? "");
-  const re = /<!--\s*QB_JSON\s*([\s\S]*?)-->/i;
-  const m = raw.match(re);
-  if (!m) return { cleanedText: raw.trim() };
-
-  const inner = (m[1] ?? "").trim();
-
-  let parsed: any = undefined;
-  try {
-    parsed = JSON.parse(inner);
-  } catch {
-    parsed = undefined;
-  }
-
-  const cleanedText = raw.replace(re, "").trim();
-  return { cleanedText, qbJson: parsed };
 }
 
 export async function runSalesStrategy(args: RunSalesStrategyArgs) {
@@ -100,7 +72,7 @@ If you produce telemetry, append:
   const raw = String(llm.text ?? "").trim();
   if (!raw) throw new Error("salesStrategy returned empty response");
 
-  const { cleanedText, qbJson } = extractQbJsonBlock(raw);
+  const { cleanedText, qbJson } = extractQbJsonBlock<SalesStrategyTelemetry>(raw);
 
   return {
     ok: true,
