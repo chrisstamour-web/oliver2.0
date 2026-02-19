@@ -26,6 +26,11 @@ const QB_TIMEOUT_MS = 6_000;
 const AGENT_TIMEOUT_MS = 18_000;
 const MAX_AGENT_CONCURRENCY = 3;
 
+// Research tuning
+const PPLX_MAX_TOKENS = 1800; // keep research compact; caching provides continuity
+const PPLX_CACHE_TTL_DAYS = 7; // match cache query window
+const MIN_KB_HITS_FOR_SKIP_RESEARCH = 4; // if KB is rich, we can often skip web research for hospitals
+
 // -----------------------------
 // Types
 // -----------------------------
@@ -171,11 +176,78 @@ async function inferThreadTitle(args: { lastUser: string; recentMessages: ChatMe
 }
 
 // -----------------------------
+// Robust entity detection (hospital/org)
+// -----------------------------
+function looksLikeHospital(text: string): boolean {
+  const t = String(text ?? "");
+  if (!t.trim()) return false;
+
+  // strong keywords
+  if (/(hospital|health\s*system|medical\s*center|medical centre|cancer\s*center|cancer centre|clinic|infirmary)/i.test(t))
+    return true;
+
+  // common naming patterns
+  if (/university of .* (health|hospital|medical)/i.test(t)) return true;
+  if (/(?:\b[A-Z][a-z]+\b\s+){1,}(Hospital|Health|Medical Center|Medical Centre|Cancer Center|Cancer Centre)\b/.test(t))
+    return true;
+
+  return false;
+}
+
+function looksLikeNamedEntity(text: string): boolean {
+  const t = String(text ?? "");
+  if (!t.trim()) return false;
+
+  // 2+ capitalized words (rough proper noun heuristic)
+  if (/([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,})/.test(t)) return true;
+
+  // org-ish suffixes
+  if (/(Inc\.|LLC|Ltd|University|Health|Hospital|Clinic|System|Medical Center|Medical Centre|Cancer Center|Cancer Centre)/i.test(t))
+    return true;
+
+  return false;
+}
+
+function looksLikeIntelRequest(text: string): boolean {
+  const t = String(text ?? "");
+  if (!t.trim()) return false;
+
+  return /(prospect|account|research|intel|intelligence|background|overview|who is|leadership|team|staff|contacts|director|vp|cfo|ceo|head of|procurement|purchasing|rfp|rfi|vendor|partners|stack|platform|uses|implements|installed|linac|tps|eclipse|aria|raystation|mosaiq)/i.test(
+    t
+  );
+}
+
+/**
+ * Try to pick a stable research target.
+ * Priority:
+ *  1) Thread title (after auto-title) if it’s not "New chat"
+ *  2) First strong "X Health/Hospital/Medical Center" phrase in lastUser
+ *  3) Fallback: first 120 chars of lastUser
+ */
+function pickResearchTarget(args: { threadTitle: string; lastUser: string }): string {
+  const threadTitle = String(args.threadTitle ?? "").trim();
+  const lastUser = String(args.lastUser ?? "").trim();
+
+  if (threadTitle && threadTitle.toLowerCase() !== "new chat") return threadTitle;
+
+  const m =
+    lastUser.match(
+      /((?:\b[A-Z][a-zA-Z&.'-]+\b\s+){0,6}\b(?:Health(?:\sSystem)?|Hospital|Medical Center|Medical Centre|Cancer Center|Cancer Centre)\b(?:\s(?:of|at)\s(?:\b[A-Z][a-zA-Z&.'-]+\b\s*){1,6})?)/ // best-effort
+    ) ?? null;
+
+  const candidate = (m?.[1] ?? "").trim();
+  if (candidate && candidate.length >= 6 && candidate.length <= 120) return candidate;
+
+  return lastUser.slice(0, 120);
+}
+
+// -----------------------------
 // Perplexity prompt construction (company-agnostic)
 // -----------------------------
 function buildPerplexityMessages(args: {
   target: string;
   purpose?: string; // e.g. "prospect_research"
+  kind?: "hospital" | "organization";
   extraQueries?: string[];
 }): ChatMessage[] {
   const system = [
@@ -212,14 +284,15 @@ function buildPerplexityMessages(args: {
     `- Keep it concise: bullets over prose.`,
   ].join("\n");
 
-  const schema = `
+  const schemaBase = `
 ORGANIZATION INTELLIGENCE REPORT
 Target: ${args.target}
 Purpose: ${args.purpose ?? "prospect_research"}
+Type: ${args.kind ?? "organization"}
 
 ## 1) IDENTITY + STRUCTURE
 Legal name | Common name | Headquarters | Regions served + Evidence (URL + quote)
-Ownership/parent org | Subsidiaries/affiliates | Org type (public/private/nonprofit/gov) + Evidence
+Ownership/parent org | Affiliates | Org type (public/private/nonprofit/gov) + Evidence
 
 ## 2) OFFERINGS + CUSTOMERS
 Primary offerings/services/products (top 3–7) + Evidence
@@ -251,25 +324,32 @@ Critical data NOT found + sources checked
 Complete URL list
 `.trim();
 
-  const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 8);
+  const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 10);
   const extraBlock = extra.length
     ? `\n\nADDITIONAL SEARCH QUERIES (use to guide your search):\n- ${extra.join("\n- ")}`
     : "";
 
   return [
     { role: "system", content: system },
-    { role: "user", content: schema + extraBlock },
+    { role: "user", content: schemaBase + extraBlock },
   ];
 }
 
 function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown; url?: unknown }[] }) {
   const lines: string[] = [];
   lines.push("[External Research — Perplexity]");
-  if (p.answer) lines.push(String(p.answer).trim());
+
+  // Keep the research block small so it doesn't blow up synthesis tokens.
+  // Full text still goes to research_cache.
+  const a = String(p.answer ?? "").trim();
+  if (a) {
+    const maxChars = 2600;
+    lines.push(a.length > maxChars ? a.slice(0, maxChars) + "\n…(truncated for context)" : a);
+  }
 
   if (p.citations?.length) {
     lines.push("\nCitations:");
-    for (const c of p.citations.slice(0, 8)) {
+    for (const c of p.citations.slice(0, 10)) {
       const t = String(c?.title ?? "").trim();
       const rawUrl = (c as any)?.url;
       const url =
@@ -288,14 +368,14 @@ function formatResearchBlock(p: { answer?: string; citations?: { title?: unknown
 // -----------------------------
 // Research cache
 // -----------------------------
-function makeCacheKey(input: { route: string; queries: string[]; lastUser: string }) {
-  const q = (input.queries ?? []).slice(0, 3).join("|");
-  const u = (input.lastUser ?? "").slice(0, 200);
-  return `route=${input.route}::q=${q}::u=${u}`;
+function makeCacheKey(input: { route: string; queries: string[]; target: string }) {
+  const q = (input.queries ?? []).slice(0, 4).join("|");
+  const t = (input.target ?? "").slice(0, 160);
+  return `route=${input.route}::target=${t}::q=${q}`;
 }
 
 async function getCachedResearch(supabase: any, tenantId: string, cacheKey: string) {
-  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const since = new Date(Date.now() - PPLX_CACHE_TTL_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   const { data, error } = await supabase
     .from("research_cache")
@@ -464,7 +544,8 @@ function enforceSpecialistCountByMode(args: {
   const specialists = planned.filter((a) => a !== "chat");
 
   const take = (n: number) => specialists.slice(0, Math.max(0, n));
-  const clamp = (min: number, max: number) => specialists.slice(0, Math.max(min, Math.min(max, specialists.length)));
+  const clamp = (min: number, max: number) =>
+    specialists.slice(0, Math.max(min, Math.min(max, specialists.length)));
 
   if (mode === "rules") {
     const out = take(1);
@@ -622,7 +703,7 @@ export async function POST(req: Request) {
     }
 
     // -----------------------------
-    // KB retrieval (never fatal + timed) — run before research gating
+    // KB retrieval (never fatal + timed) — run early so we can decide if KB is thin
     // -----------------------------
     let kbMsg: ChatMessage | null = null;
     let usedKb = false;
@@ -646,8 +727,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // If user mentions Adaptiiv explicitly, inject canonical KB doc (single source of truth).
-    // Update this query string to match your canonical KB doc title/ID.
+    // Optional: Inject canonical product brief if Adaptiiv is mentioned
     const mentionsAdaptiiv = /adaptiiv/i.test(lastUser);
     let adaptiivKbMsg: ChatMessage | null = null;
 
@@ -692,77 +772,84 @@ export async function POST(req: Request) {
       routing?.priority_order?.length ? routing.priority_order : routing?.agents_to_call
     );
 
-    // normalize + filter to runnable (including "chat")
     const plannedAgents = plannedAgentsRaw.map(normalizeAgentId).filter((a) => RUNNABLE.has(a));
 
-    // ✅ Enforce specialist count by decision_mode
     const enforced = enforceSpecialistCountByMode({ mode: rawMode, planned: plannedAgents });
 
-    // Only run known agents + always include chat fallback
     const agentsToRun = enforced.specialists.length ? enforced.specialists : ["chat"];
 
-    // route string is used only for research cache keying
     const routeForCache = (agentsToRun.find((a) => a !== "chat") as string | undefined) ?? "chat";
 
     // -----------------------------
-    // Perplexity research (cached + timed) — robust gating for prospect + people + intel
+    // Perplexity research (cached + timed) — robust + hospital-guaranteed
     // -----------------------------
     let researchMsg: ChatMessage | null = null;
     let usedResearch = false;
 
+    const isHospitalChat = looksLikeHospital(lastUser);
+    const namedEntity = looksLikeNamedEntity(lastUser);
+    const intelRequest = looksLikeIntelRequest(lastUser);
+
     const researchQueries = Array.isArray((decision as any)?.researchQueries)
-      ? ((decision as any).researchQueries as any[])
-          .map((q) => String(q ?? "").trim())
-          .filter(Boolean)
+      ? ((decision as any).researchQueries as any[]).map((q) => String(q ?? "").trim()).filter(Boolean)
       : [];
 
     const needsResearch = Boolean((decision as any)?.needsResearch);
 
     const specialistIdsPlanned = agentsToRun.filter((a) => a !== "chat");
 
-    // If any of these agents are running, external intel is often valuable
     const researchSensitiveAgents = new Set(["icpFit", "stakeholderMapping", "salesStrategy", "draftOutreach"]);
     const routeSensitive = specialistIdsPlanned.some((a) => researchSensitiveAgents.has(a));
 
-    const kbLooksThin = kbHitCount < 3;
+    const kbLooksThin = kbHitCount < MIN_KB_HITS_FOR_SKIP_RESEARCH;
 
-    // “This looks like prospect/account/person intel”
-    const looksLikeIntelRequest =
-      /(prospect|account|research|intel|intelligence|background|overview|who is|leadership|team|staff|contacts|director|vp|cfo|ceo|head of|procurement|purchasing|rfp|rfi|vendor|partners|stack|platform|uses|implements|installed)/i.test(
-        lastUser
-      );
-
-    // Named entity heuristic: 2+ capitalized words OR org-ish suffixes
-    const looksLikeNamedEntity =
-      /([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,})/.test(lastUser) ||
-      /(Inc\.|LLC|Ltd|University|Health|Hospital|Clinic|System|Medical Center|Centre)/i.test(lastUser);
-
-    // Allow research if:
-    // - router asked for it + at least 1 query
-    // - OR KB is thin + looks like intel/named entity
-    // - OR route is sensitive + KB thin
+    // Guarantee: whenever it's a hospital chat, we try to include fresh/cached external context.
+    // Otherwise, run research if router asks OR KB is thin + it looks like intel.
     const canRunResearch =
+      isHospitalChat ||
       (needsResearch && researchQueries.length >= 1) ||
-      (kbLooksThin && (looksLikeIntelRequest || looksLikeNamedEntity)) ||
+      (kbLooksThin && (intelRequest || namedEntity)) ||
       (routeSensitive && kbLooksThin);
 
+    // Stable subject (prevents re-research every turn)
+    const subject = pickResearchTarget({ threadTitle: String(threadRow?.title ?? ""), lastUser });
+
     if (canRunResearch) {
+      // Robust query pack:
+      // - if QB provided queries, use them
+      // - else use a default bundle tailored for hospitals vs orgs
       const effectiveQueries =
         researchQueries.length > 0
-          ? researchQueries.slice(0, 8)
-          : [lastUser.slice(0, 300), "key personnel", "recent news", "job postings"].filter(Boolean);
+          ? researchQueries.slice(0, 10)
+          : isHospitalChat
+          ? [
+              `${subject} official site`,
+              `${subject} locations`,
+              `${subject} leadership team`,
+              `${subject} radiation oncology`,
+              `${subject} medical physics`,
+              `${subject} job postings medical physicist`,
+              `${subject} press release`,
+              `${subject} procurement RFP`,
+            ]
+          : [
+              `${subject} official site`,
+              `${subject} leadership team`,
+              `${subject} recent press release`,
+              `${subject} job postings`,
+              `${subject} technology stack`,
+              `${subject} partnerships`,
+            ];
 
       const cacheKey = makeCacheKey({
         route: routeForCache,
         queries: effectiveQueries,
-        lastUser,
+        target: subject,
       });
 
-      const cached = await withTimeout(
-        getCachedResearch(supabase, tenantId, cacheKey),
-        2_000,
-        "Research cache read"
-      ).catch(() => null);
+      const cached = await withTimeout(getCachedResearch(supabase, tenantId, cacheKey), 2_000, "Research cache read").catch(
+        () => null
+      );
 
       if (cached?.answer) {
         usedResearch = true;
@@ -774,16 +861,15 @@ export async function POST(req: Request) {
           }),
         };
       } else {
-        const subject = lastUser || "the target organization";
-
         const pplx = await withTimeout(
           callPerplexity({
             messages: buildPerplexityMessages({
               target: subject,
-              purpose: "prospect_research",
+              purpose: isHospitalChat ? "hospital_prospect_research" : "prospect_research",
+              kind: isHospitalChat ? "hospital" : "organization",
               extraQueries: effectiveQueries,
             }),
-            maxTokens: 1600,
+            maxTokens: PPLX_MAX_TOKENS,
           }),
           RESEARCH_TIMEOUT_MS,
           "Perplexity research"
@@ -808,6 +894,12 @@ export async function POST(req: Request) {
             answer: (pplx as any).answer,
             citations: (pplx as any).citations ?? [],
           }).catch(() => {});
+        } else {
+          // make failures visible in logs (so you can tell if PPLX isn't configured)
+          console.log("PPLX_FAIL", {
+            subject,
+            error: (pplx as any)?.error ?? "unknown",
+          });
         }
       }
     }
@@ -834,12 +926,16 @@ export async function POST(req: Request) {
       agentsToRun,
       needsResearch,
       canRunResearch,
+      subject,
+      isHospitalChat,
       kbHitCount,
       kbLooksThin,
-      looksLikeIntelRequest,
-      looksLikeNamedEntity,
+      intelRequest,
+      namedEntity,
       routeSensitive,
       researchQueriesCount: researchQueries.length,
+      usedResearch,
+      usedKb,
       runnable: Array.from(RUNNABLE),
     });
 
@@ -965,11 +1061,9 @@ export async function POST(req: Request) {
     // -----------------------------
     try {
       if (isEmptyTitle(threadRow?.title)) {
-        const title = await withTimeout(
-          inferThreadTitle({ lastUser, recentMessages: messages }),
-          3_000,
-          "Thread auto-title"
-        ).catch(() => "");
+        const title = await withTimeout(inferThreadTitle({ lastUser, recentMessages: messages }), 3_000, "Thread auto-title").catch(
+          () => ""
+        );
 
         const finalTitle = cleanTitle(title);
 
@@ -991,8 +1085,9 @@ export async function POST(req: Request) {
       confidence: (decision as any).confidence,
       usedResearch,
       usedKb,
-      routing: effectiveRouting, // ✅ return post-enforcement routing
-      qb_routing_raw: routing, // optional debug
+      research_subject: subject,
+      routing: effectiveRouting,
+      qb_routing_raw: routing,
       executed_agents: agentsToRun,
       runnable_agents: Array.from(RUNNABLE),
       specialist_results: settled.map((s, i) => ({
