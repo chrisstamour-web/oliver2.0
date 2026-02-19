@@ -37,7 +37,8 @@ function splitByHeadings(md: string): string[] {
   const headingIdx: number[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    if (/^#{2,3}\s+/.test(lines[i])) headingIdx.push(i);
+ if (/^#{1,4}\s+/.test(lines[i])) headingIdx.push(i);
+
   }
 
   // If no headings, one section

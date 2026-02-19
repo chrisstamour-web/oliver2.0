@@ -124,8 +124,10 @@ export async function mapNotionKbPageToRow(page: any): Promise<KbDocumentRow> {
 
   const summary = plainText(getProp(page, "Summary")?.rich_text) || null;
 
-  const content = await notionPageToMarkdown(source_id);
-  if (!content) throw new Error(`KB page ${source_id} has empty content`);
+const contentRaw = await notionPageToMarkdown(source_id);
+const content = String(contentRaw ?? "").trim();
+if (!content) throw new Error(`KB page ${source_id} has empty content after trim`);
+
 
   /* -------- Tags -------- */
   const tags = multiSelectNames(getProp(page, "Tags"));

@@ -171,12 +171,16 @@ async function inferThreadTitle(args: { lastUser: string; recentMessages: ChatMe
 }
 
 // -----------------------------
-// Perplexity prompt construction
+// Perplexity prompt construction (company-agnostic)
 // -----------------------------
-function buildPerplexityMessages(args: { target: string; extraQueries?: string[] }): ChatMessage[] {
+function buildPerplexityMessages(args: {
+  target: string;
+  purpose?: string; // e.g. "prospect_research"
+  extraQueries?: string[];
+}): ChatMessage[] {
   const system = [
     `ROLE + OBJECTIVE (STRICT)`,
-    `You are a hospital intelligence researcher.`,
+    `You are an organization intelligence researcher.`,
     `Collect FACTS ONLY — no scoring, analysis, or recommendations.`,
     `Every claim MUST include a URL citation and, when possible, a short quote.`,
     ``,
@@ -186,14 +190,14 @@ function buildPerplexityMessages(args: { target: string; extraQueries?: string[]
     `- UNKNOWN: not found after searching; list sources checked`,
     ``,
     `SOURCE PRIORITY (use in order)`,
-    `1) Hospital official websites`,
-    `2) LinkedIn profiles (current role at hospital)`,
-    `3) PubMed/Google Scholar`,
-    `4) Press releases (hospital/vendor)`,
-    `5) Job postings`,
-    `6) Conference abstracts (AAPM/ASTRO/ESTRO)`,
-    `7) Local news`,
-    `8) Government databases (e.g., cancer.gov, CMS)`,
+    `1) Official organization websites (incl. subdomains)`,
+    `2) Regulatory / government sources (where relevant)`,
+    `3) Press releases (org/vendor)`,
+    `4) Job postings (org + reputable boards)`,
+    `5) LinkedIn profiles (current role at org)`,
+    `6) Conference talks / webinars / abstracts`,
+    `7) Industry publications (reputable)`,
+    `8) Local news`,
     ``,
     `EXCLUDED SOURCES`,
     `- Wikipedia / general wikis`,
@@ -202,52 +206,42 @@ function buildPerplexityMessages(args: { target: string; extraQueries?: string[]
     `- sources older than 3 years for time-sensitive claims (unless only evidence)`,
     ``,
     `OUTPUT RULES`,
-    `- Follow the schema exactly (single definition per field; NO duplication).`,
-    `- Prefer last 24 months for staffing/equipment/software; include dates.`,
+    `- Follow the schema exactly (NO duplication).`,
+    `- Prefer last 24 months for people/tech/initiatives; include dates.`,
     `- If UNKNOWN, write UNKNOWN + sources checked.`,
+    `- Keep it concise: bullets over prose.`,
   ].join("\n");
 
   const schema = `
-HOSPITAL INTELLIGENCE REPORT
-Hospital: ${args.target}
+ORGANIZATION INTELLIGENCE REPORT
+Target: ${args.target}
+Purpose: ${args.purpose ?? "prospect_research"}
 
-## 1. RADIATION ONCOLOGY INFRASTRUCTURE
-TPS: Brand | Version (if Eclipse) | Evidence (URL + quote) | Confidence (CONFIRMED/ESTIMATED/UNKNOWN)
-Linacs: Varian models + qty | Non-Varian | Installation dates | Evidence (URL + quote)
-Staff: Physicists (count + names + LinkedIn URLs) | Dosimetrists | Rad Oncs | Method + Evidence URLs
+## 1) IDENTITY + STRUCTURE
+Legal name | Common name | Headquarters | Regions served + Evidence (URL + quote)
+Ownership/parent org | Subsidiaries/affiliates | Org type (public/private/nonprofit/gov) + Evidence
 
-## 2. CLINICAL VOLUME
-Skin cancer volume: Explicit data OR estimate (bed count, NCI designation, dedicated program, physician subspecializations, reasoning, confidence) + Evidence URLs
-Mohs + radiation partnership: Yes/No/Unknown + Evidence URL
+## 2) OFFERINGS + CUSTOMERS
+Primary offerings/services/products (top 3–7) + Evidence
+Primary customer segments | Core markets | Key use-cases + Evidence
 
-## 3. INSTITUTIONAL CHARACTERISTICS
-Type | NCI designation | Med school affiliation | Residency + Evidence URLs
-Ownership | Reimbursement model (HOPD/Freestanding) | Health system + Evidence URLs
-Financial signals: Capital investments (2yr) | Equipment purchases | Distress signals + Evidence URLs
+## 3) TECHNOLOGY + OPERATIONS (ONLY what you can prove)
+Key systems/tools/platforms mentioned publicly + Evidence
+Operational signals (recent upgrades, migrations, modernization) + Evidence
 
-## 4. KEY PERSONNEL
-Chief Medical Physicist: Name, title, LinkedIn, email, background, AAPM chapter/leadership, publications (last 3yr, up to 5), LinkedIn activity (6mo) + Evidence URLs
-Secondary: Rad Onc (skin), Dosimetry Mgr, Dept Admin, Procurement Dir — Name + LinkedIn + relevant details + Evidence URLs
+## 4) KEY PEOPLE (LAST 24 MONTHS)
+Exec sponsor candidates (names + titles + LinkedIn URLs) + Evidence
+Functional leaders relevant to the purpose (names + titles + LinkedIn URLs) + Evidence
 
-## 5. TRIGGER EVENTS (Last 6 Months)
+## 5) HIRING + INVESTMENT SIGNALS
+Job postings (last 12mo): Title | date | quote | URL
+Capital initiatives / partnerships / funding (last 24mo): item | date | quote | URL
+
+## 6) TRIGGER EVENTS (LAST 6 MONTHS)
 For each: Event | Date | Evidence (URL + quote)
-- Equipment purchases/installations
-- Tech upgrades
-- Staffing changes (hires + open positions)
-- LinkedIn pain signals
-- Publications
-- Strategic initiatives
 
-## 6. WORKFLOW PAIN EVIDENCE
-Job postings (last 12mo): Title | date | key language (quote) | URL
-Abstracts/publications: Citation | relevance quote | URL
-
-## 7. COMPETITIVE LANDSCAPE
-Auto-planning | Auto-contouring | 3D bolus — name or "None detected" | evidence | contract timing (if found)
-Vendor relationships | RFP/procurement activity + Evidence URLs
-
-## 8. RELATIONSHIP MAPPING
-Co-author networks | AAPM overlap | LinkedIn connections | Conference co-presentations + Evidence URLs
+## 7) COMPETITIVE / VENDOR LANDSCAPE (ONLY if evidenced)
+Named vendors/partners | procurement/RFP mentions | contract timing (if found) + Evidence
 
 ## DATA GAPS
 Critical data NOT found + sources checked
@@ -257,7 +251,7 @@ Critical data NOT found + sources checked
 Complete URL list
 `.trim();
 
-  const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 5);
+  const extra = (args.extraQueries ?? []).filter(Boolean).slice(0, 8);
   const extraBlock = extra.length
     ? `\n\nADDITIONAL SEARCH QUERIES (use to guide your search):\n- ${extra.join("\n- ")}`
     : "";
@@ -421,6 +415,12 @@ function buildSynthesisPrompt(lastUser: string): ChatMessage {
       `${u || "(unknown)"}\n\n` +
       `Rules:\n` +
       `- Be direct and helpful.\n` +
+      `- Default to SHORT unless the user explicitly asks for detail.\n` +
+      `- Max 8 bullets total.\n` +
+      `- Use this format:\n` +
+      `  1) Answer (1–3 sentences)\n` +
+      `  2) Key points (3–6 bullets)\n` +
+      `  3) Next step (1 bullet)\n` +
       `- If something is missing, ask ONE clarifying question (only if required).\n`,
   };
 }
@@ -466,9 +466,6 @@ function enforceSpecialistCountByMode(args: {
   const take = (n: number) => specialists.slice(0, Math.max(0, n));
   const clamp = (min: number, max: number) => specialists.slice(0, Math.max(min, Math.min(max, specialists.length)));
 
-  // We enforce by:
-  // - truncating if too many
-  // - downgrading mode if too few (safer than adding random specialists)
   if (mode === "rules") {
     const out = take(1);
     const note =
@@ -480,7 +477,7 @@ function enforceSpecialistCountByMode(args: {
 
   if (mode === "judgment") {
     if (specialists.length < 2) {
-      const downgraded = specialists.length === 1 ? "rules" : "rules";
+      const downgraded = "rules";
       return {
         mode: downgraded,
         specialists: take(1),
@@ -624,7 +621,52 @@ export async function POST(req: Request) {
       }
     }
 
+    // -----------------------------
+    // KB retrieval (never fatal + timed) — run before research gating
+    // -----------------------------
+    let kbMsg: ChatMessage | null = null;
+    let usedKb = false;
+    let kbHitCount = 0;
+
+    if (lastUser?.trim()) {
+      const kbRes = await withTimeout(
+        searchKb({ tenantId, query: lastUser.slice(0, 800), limit: 6 }),
+        KB_TIMEOUT_MS,
+        "KB search"
+      ).catch(() => null);
+
+      kbHitCount = Array.isArray(kbRes) ? kbRes.length : 0;
+
+      if (kbRes?.length) {
+        const kbBlock = formatKbBlock(kbRes);
+        if (kbBlock) {
+          kbMsg = { role: "assistant", content: kbBlock };
+          usedKb = true;
+        }
+      }
+    }
+
+    // If user mentions Adaptiiv explicitly, inject canonical KB doc (single source of truth).
+    // Update this query string to match your canonical KB doc title/ID.
+    const mentionsAdaptiiv = /adaptiiv/i.test(lastUser);
+    let adaptiivKbMsg: ChatMessage | null = null;
+
+    if (mentionsAdaptiiv) {
+      const adaptiivRes = await withTimeout(
+        searchKb({ tenantId, query: "Adaptiiv Canonical Product Brief Approved", limit: 4 }),
+        KB_TIMEOUT_MS,
+        "KB search (Adaptiiv canonical)"
+      ).catch(() => null);
+
+      if (adaptiivRes?.length) {
+        const block = formatKbBlock(adaptiivRes);
+        if (block) adaptiivKbMsg = { role: "assistant", content: block };
+      }
+    }
+
+    // -----------------------------
     // QB routing
+    // -----------------------------
     const decision = await withTimeout(
       decideRouteWithQb({ messages, decisionContext: {}, entityData: {} }),
       QB_TIMEOUT_MS,
@@ -663,7 +705,7 @@ export async function POST(req: Request) {
     const routeForCache = (agentsToRun.find((a) => a !== "chat") as string | undefined) ?? "chat";
 
     // -----------------------------
-    // Perplexity research (cached + timed)
+    // Perplexity research (cached + timed) — robust gating for prospect + people + intel
     // -----------------------------
     let researchMsg: ChatMessage | null = null;
     let usedResearch = false;
@@ -675,12 +717,44 @@ export async function POST(req: Request) {
       : [];
 
     const needsResearch = Boolean((decision as any)?.needsResearch);
-    const canRunResearch = needsResearch && researchQueries.length >= 3;
+
+    const specialistIdsPlanned = agentsToRun.filter((a) => a !== "chat");
+
+    // If any of these agents are running, external intel is often valuable
+    const researchSensitiveAgents = new Set(["icpFit", "stakeholderMapping", "salesStrategy", "draftOutreach"]);
+    const routeSensitive = specialistIdsPlanned.some((a) => researchSensitiveAgents.has(a));
+
+    const kbLooksThin = kbHitCount < 3;
+
+    // “This looks like prospect/account/person intel”
+    const looksLikeIntelRequest =
+      /(prospect|account|research|intel|intelligence|background|overview|who is|leadership|team|staff|contacts|director|vp|cfo|ceo|head of|procurement|purchasing|rfp|rfi|vendor|partners|stack|platform|uses|implements|installed)/i.test(
+        lastUser
+      );
+
+    // Named entity heuristic: 2+ capitalized words OR org-ish suffixes
+    const looksLikeNamedEntity =
+      /([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,})/.test(lastUser) ||
+      /(Inc\.|LLC|Ltd|University|Health|Hospital|Clinic|System|Medical Center|Centre)/i.test(lastUser);
+
+    // Allow research if:
+    // - router asked for it + at least 1 query
+    // - OR KB is thin + looks like intel/named entity
+    // - OR route is sensitive + KB thin
+    const canRunResearch =
+      (needsResearch && researchQueries.length >= 1) ||
+      (kbLooksThin && (looksLikeIntelRequest || looksLikeNamedEntity)) ||
+      (routeSensitive && kbLooksThin);
 
     if (canRunResearch) {
+      const effectiveQueries =
+        researchQueries.length > 0
+          ? researchQueries.slice(0, 8)
+          : [lastUser.slice(0, 300), "key personnel", "recent news", "job postings"].filter(Boolean);
+
       const cacheKey = makeCacheKey({
         route: routeForCache,
-        queries: researchQueries,
+        queries: effectiveQueries,
         lastUser,
       });
 
@@ -700,15 +774,16 @@ export async function POST(req: Request) {
           }),
         };
       } else {
-        const subject = lastUser || "the target hospital";
+        const subject = lastUser || "the target organization";
 
         const pplx = await withTimeout(
           callPerplexity({
             messages: buildPerplexityMessages({
               target: subject,
-              extraQueries: researchQueries,
+              purpose: "prospect_research",
+              extraQueries: effectiveQueries,
             }),
-            maxTokens: 2200,
+            maxTokens: 1600,
           }),
           RESEARCH_TIMEOUT_MS,
           "Perplexity research"
@@ -738,31 +813,12 @@ export async function POST(req: Request) {
     }
 
     // -----------------------------
-    // KB retrieval (never fatal + timed)
-    // -----------------------------
-    let kbMsg: ChatMessage | null = null;
-    let usedKb = false;
-
-    if (lastUser?.trim()) {
-      const kbRes = await withTimeout(
-        searchKb({ tenantId, query: lastUser.slice(0, 800), limit: 6 }),
-        KB_TIMEOUT_MS,
-        "KB search"
-      ).catch(() => null);
-
-      if (kbRes?.length) {
-        const kbBlock = formatKbBlock(kbRes);
-        if (kbBlock) {
-          kbMsg = { role: "assistant", content: kbBlock };
-          usedKb = true;
-        }
-      }
-    }
-
-    // -----------------------------
     // Build augmented context
     // -----------------------------
     let augmented: ChatMessage[] = [...messages];
+
+    // Inject canonical product brief first (if applicable), then general KB, then account memory, then research.
+    augmented = insertBeforeLastUser(augmented, adaptiivKbMsg);
     augmented = insertBeforeLastUser(augmented, kbMsg);
 
     if (accountMsg) augmented = [...augmented, accountMsg];
@@ -777,6 +833,12 @@ export async function POST(req: Request) {
       enforcement_note: enforced.enforcement_note,
       agentsToRun,
       needsResearch,
+      canRunResearch,
+      kbHitCount,
+      kbLooksThin,
+      looksLikeIntelRequest,
+      looksLikeNamedEntity,
+      routeSensitive,
       researchQueriesCount: researchQueries.length,
       runnable: Array.from(RUNNABLE),
     });
@@ -874,7 +936,7 @@ export async function POST(req: Request) {
     const llm = await callClaude({
       system: agent.systemPrompt,
       messages: finalMessages,
-      maxTokens: 2000,
+      maxTokens: 2000, // per your request
     });
 
     if (!llm.ok) {
